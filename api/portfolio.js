@@ -96,12 +96,15 @@ export default async function handler(req, res) {
   function parseSubledger(entries, currentBalance) {
     const ledger = entries.filter(e => e.account === 'Syndicator Distributions Payable');
 
-    let totalDeposits = 0;
+    let externalDeposits = 0;
+    let reinvestedReturns = 0;
     let totalWithdrawals = 0;
     let totalInvestments = 0;
     let totalAllocations = 0;
     let totalCostSharing = 0;
     let totalEarlyPayoff = 0;
+    let merchantPayments = 0;
+    let refiProceeds = 0;
 
     const dailyFlows = {};
     const flowsByDate = {};
@@ -115,7 +118,12 @@ export default async function handler(req, res) {
       if (!dailyFlows[date]) dailyFlows[date] = { deposits: 0, withdrawals: 0, allocations: 0, fees: 0 };
 
       if (desc.includes('syndicator deposit:')) {
-        totalDeposits += credit;
+        // Separate external deposits from reinvestments
+        if (desc.includes('reinvest')) {
+          reinvestedReturns += credit;
+        } else {
+          externalDeposits += credit;
+        }
         dailyFlows[date].deposits += credit;
         if (!flowsByDate[date]) flowsByDate[date] = 0;
         flowsByDate[date] -= credit;
@@ -130,6 +138,9 @@ export default async function handler(req, res) {
         totalAllocations += credit;
         if (desc.includes('early payoff') || desc.includes('early partial payoff')) {
           totalEarlyPayoff += credit;
+          refiProceeds += credit;
+        } else {
+          merchantPayments += credit;
         }
         dailyFlows[date].allocations += credit;
       } else if (desc.includes('cost-sharing deductions:')) {
@@ -137,6 +148,8 @@ export default async function handler(req, res) {
         dailyFlows[date].fees += debit;
       }
     }
+
+    const totalDeposits = externalDeposits + reinvestedReturns;
 
     // XIRR flows
     const xirrFlows = [];
@@ -176,9 +189,13 @@ export default async function handler(req, res) {
 
     return {
       totalDeposits: round2(totalDeposits),
+      externalDeposits: round2(externalDeposits),
+      reinvestedReturns: round2(reinvestedReturns),
       totalWithdrawals: round2(totalWithdrawals),
       totalInvestments: round2(totalInvestments),
       totalAllocations: round2(totalAllocations),
+      merchantPayments: round2(merchantPayments),
+      refiProceeds: round2(refiProceeds),
       totalCostSharing: round2(totalCostSharing),
       totalEarlyPayoff: round2(totalEarlyPayoff),
       netCollections: round2(totalAllocations - totalCostSharing),
@@ -243,38 +260,66 @@ export default async function handler(req, res) {
     const dates = perfs.map(d => d.fundedDate).filter(Boolean).sort();
     const l = ld || {};
 
+    // Management fees = upfront bank fees from deals (deducted from funded amount)
+    const managementFees = Math.round(sum(perfs, d => d.feesPaid));
+    // Residual commissions = per-transaction cost-sharing from subledger
+    const residualCommissions = Math.round(l.totalCostSharing || 0);
+    const allFees = managementFees + residualCommissions;
+
     return {
       syndicatorName: synInfo?.name || 'All Syndicators',
       syndicatorId: synInfo?.id || '',
       period: { start: dates[0] ? new Date(dates[0]).toLocaleDateString() : 'N/A', end: new Date().toLocaleDateString() },
       durationDays: dates[0] ? Math.floor((new Date() - new Date(dates[0])) / 86400000) : 0,
-      totalDeposits: l.totalDeposits || 0, externalCapital: l.totalDeposits || 0,
-      reinvestedReturns: 0, totalWithdrawals: l.totalWithdrawals || 0,
+
+      // Capital Activity — from subledger
+      totalDeposits: l.totalDeposits || 0,
+      externalCapital: l.externalDeposits || 0,
+      reinvestedReturns: l.reinvestedReturns || 0,
+      totalWithdrawals: l.totalWithdrawals || 0,
       netCapitalDeployed: round2((l.totalDeposits || 0) - (l.totalWithdrawals || 0)),
       currentCashBalance: l.currentCashBalance || synInfo?.runningBalance || 0,
+
+      // Deal metrics
       totalInvested: Math.round(totalInvested), numDeals: perfs.length,
       avgDealSize: perfs.length > 0 ? Math.round(totalInvested / perfs.length) : 0,
+
+      // Collections — from subledger allocations
       totalGrossCollections: Math.round(l.totalAllocations || totalCollected),
       collectionsPctInvested: totalInvested > 0 ? round2((l.totalAllocations || totalCollected) / totalInvested) : 0,
-      totalMerchantPayments: Math.round(l.totalAllocations || totalCollected),
-      refiProceeds: 0, balanceTransfersIn: 0, balanceTransfersOut: 0,
-      managementFees: 0, residualCommissions: 0,
-      totalFees: Math.round(l.totalCostSharing || totalFees),
-      feesPctInvested: totalInvested > 0 ? round2((l.totalCostSharing || totalFees) / totalInvested) : 0,
-      feesPctCollections: (l.totalAllocations || totalCollected) > 0 ? round2((l.totalCostSharing || totalFees) / (l.totalAllocations || totalCollected)) : 0,
-      netCollections: Math.round(l.netCollections || (totalCollected - totalFees)),
+      totalMerchantPayments: Math.round(l.merchantPayments || totalCollected),
+      refiProceeds: Math.round(l.refiProceeds || 0),
+      balanceTransfersIn: 0, balanceTransfersOut: 0,
+
+      // Fees — management (upfront from deals) + residual (per-txn from subledger)
+      managementFees: managementFees,
+      residualCommissions: residualCommissions,
+      totalFees: allFees,
+      feesPctInvested: totalInvested > 0 ? round2(allFees / totalInvested) : 0,
+      feesPctCollections: (l.totalAllocations || totalCollected) > 0 ? round2(allFees / (l.totalAllocations || totalCollected)) : 0,
+
+      // Net
+      netCollections: Math.round((l.totalAllocations || totalCollected) - allFees),
       unreturned: Math.round(unreturned), grossPnL: Math.round(grossPnL),
-      totalCurrentValue: Math.round((l.currentCashBalance || 0) + unreturned),
-      netProfit: Math.round((l.currentCashBalance || 0) + unreturned - totalInvested),
+
+      // Value
+      totalCurrentValue: Math.round((l.currentCashBalance || synInfo?.runningBalance || 0) + unreturned),
+      netProfit: Math.round((l.currentCashBalance || synInfo?.runningBalance || 0) + unreturned - totalInvested),
       projectedXIRR: 0,
-      cashOnCashMultiple: totalInvested > 0 ? round2(((l.currentCashBalance || 0) + unreturned + (l.totalWithdrawals || 0)) / totalInvested) : 0,
+      cashOnCashMultiple: totalInvested > 0 ? round2(((l.currentCashBalance || synInfo?.runningBalance || 0) + unreturned + (l.totalWithdrawals || 0)) / totalInvested) : 0,
+
+      // Deal counts
       dealsInProfit: profit, dealsActiveBelowBasis: active, dealsDefaulted: defaulted,
       winRate: perfs.length > 0 ? round2(profit / perfs.length) : 0,
       defaultRate: perfs.length > 0 ? round2(defaulted / perfs.length) : 0,
+
+      // Realized/Unrealized
       realizedValue: 0, realizedPnL: 0, realizedROI: 0,
       unrealizedValue: Math.round(unreturned),
       pctStillOutstanding: totalInvested > 0 ? round2(unreturned / totalInvested) : 0,
       xirrFullRecovery: 0, xirrTotalLoss: 0,
+
+      // Business-level
       totalNetFunded: Math.round(totalNetFunded), totalRTR: Math.round(totalRTR),
       totalCollectedBiz: Math.round(totalCollectedBiz),
       collectionPctNF: totalNetFunded > 0 ? round2(totalCollectedBiz / totalNetFunded) : 0,
