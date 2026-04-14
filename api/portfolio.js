@@ -1,13 +1,13 @@
 // Vercel Serverless Function: /api/portfolio
-// Aggregates all deal data into the dashboard structure
+// Maps actual SmartMCA staging API fields to dashboard structure
 
 export default async function handler(req, res) {
   const API_KEY = process.env.SMARTMCA_API_KEY;
-  const API_BASE = process.env.SMARTMCA_API_BASE || 'https://api.nexus.smartmca.com/api/public/v1';
+  const API_BASE = process.env.SMARTMCA_API_BASE || 'https://api.staging.v3.smartmca.com/api/public/v1';
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
-  if (!API_KEY) return res.status(500).json({ error: 'SMARTMCA_API_KEY not configured. Add it in Vercel → Settings → Environment Variables.' });
+  if (!API_KEY) return res.status(500).json({ error: 'SMARTMCA_API_KEY not configured.' });
 
   async function apiFetch(path, params = {}) {
     const qs = new URLSearchParams(params).toString();
@@ -19,197 +19,234 @@ export default async function handler(req, res) {
     return resp.json();
   }
 
+  // Page-based pagination (meta.pagination.page, totalPages)
   async function getAllDeals() {
     const deals = [];
-    let cursor = null;
+    let page = 1;
     while (true) {
-      const params = { limit: '100' };
-      if (cursor) params.cursor = cursor;
-      const resp = await apiFetch('/deals', params);
-      deals.push(...resp.data);
-      if (!resp.meta?.pagination?.has_more) break;
-      cursor = resp.meta.pagination.next_cursor;
+      const resp = await apiFetch('/deals', { limit: '100', page: String(page) });
+      if (resp.data) deals.push(...resp.data);
+      const pag = resp.meta?.pagination;
+      if (!pag || page >= pag.totalPages) break;
+      page++;
     }
     return deals;
   }
 
-  async function getDealPayments(dealId) {
-    try {
-      const resp = await apiFetch(`/deals/${dealId}/payments`, { limit: '100' });
-      return resp.data || [];
-    } catch (e) { return []; }
+  // All numeric fields from SmartMCA come as strings
+  function num(v) {
+    if (v == null || v === '') return 0;
+    const n = parseFloat(v);
+    return isNaN(n) ? 0 : n;
   }
 
-  function computeDealPerformance(deal, syndicatorPayments) {
-    const netFunded = deal.netFunded || deal.NET_FUNDED || 0;
-    const syndInvested = syndicatorPayments
-      .filter(p => p.type === 'investment')
-      .reduce((s, p) => s + (p.amount || 0), 0);
-    const syndPct = netFunded > 0 ? syndInvested / netFunded : 0;
-    const collected = syndicatorPayments
-      .filter(p => ['merchant_payment', 'refi_incoming', 'balance_transfer_in'].includes(p.type))
-      .reduce((s, p) => s + (p.amount || 0), 0);
-    const feesPaid = syndicatorPayments
-      .filter(p => ['Fee Paid (Per Transaction)', 'Management Fee Paid (One Time)'].includes(p.type))
-      .reduce((s, p) => s + (p.amount || 0), 0);
-    const netReturn = collected - syndInvested - feesPaid;
-    const roi = syndInvested > 0 ? netReturn / syndInvested : 0;
+  function toVintage(dateStr) {
+    if (!dateStr) return '';
+    const d = new Date(dateStr);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
 
-    let status = 'Active';
-    if (netReturn > 0) {
-      status = 'Profit';
+  function round2(v) { return Math.round(v * 100) / 100; }
+
+  // ============================================================
+  // MAP EACH DEAL — uses actual SmartMCA field names
+  // ============================================================
+  function mapDeal(d) {
+    const fundedAmount = num(d.fundedAmount);
+    const netFunded = num(d.netFunded);
+    const purchaseAmount = num(d.purchaseAmount);   // = RTR
+    const totalCollected = num(d.totalCollected);
+    const outstandingBalance = num(d.outstandingBalance);
+    const currentExposure = num(d.currentExposure);
+    const pnl = num(d.pAndL);
+    const bankFees = num(d.bankFees);
+    const otherFees = num(d.otherFees);
+    const paybackFactor = num(d.paybackFactor);
+    const vintage = toVintage(d.fundedDate);
+
+    // Status: API gives "active", "closed", "defaulted"
+    let status;
+    if (d.status === 'defaulted') {
+      status = 'Default';
+    } else if (d.status === 'closed') {
+      status = 'Profit';  // closed deals have been paid off
     } else {
-      const lastPayment = syndicatorPayments
-        .filter(p => p.type === 'merchant_payment')
-        .sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-      const firstInvestment = syndicatorPayments
-        .filter(p => p.type === 'investment')
-        .sort((a, b) => new Date(a.date) - new Date(b.date))[0];
-      const now = new Date();
-      const daysSinceLastPayment = lastPayment ? (now - new Date(lastPayment.date)) / 86400000 : 999;
-      const daysSinceInvestment = firstInvestment ? (now - new Date(firstInvestment.date)) / 86400000 : 0;
-      if (daysSinceLastPayment > 30 && daysSinceInvestment > 14) status = 'Default';
+      status = 'Active';  // active — may be above or below basis
     }
 
-    const remainingPayments = deal.remainingPayments || deal.REMAINING_PAYMENTS || 0;
-    const outstanding = deal.outstanding || deal.OUTSTANDING || 0;
-    const dailyAmt = deal.dailyCollectionAmount || deal.DAILY_COLLECTION_AMOUNT || 0;
-    const weeklyAmt = deal.weeklyCollectionAmount || deal.WEEKLY_COLLECTION_AMOUNT || 0;
+    const totalFees = bankFees + otherFees;
+    const netReturn = pnl;  // pAndL already accounts for fees
+    const roi = netFunded > 0 ? netReturn / netFunded : 0;
 
     return {
-      dealNo: deal.id || deal.DEAL_ID || deal.dealId,
-      merchant: deal.merchant?.legalName || deal.MERCHANT_NAME || deal.merchantName || '',
-      invested: Math.round(syndInvested * 100) / 100,
-      collected: Math.round(collected * 100) / 100,
-      feesPaid: Math.round(feesPaid * 100) / 100,
-      netReturn: Math.round(netReturn * 100) / 100,
-      roi: Math.round(roi * 100) / 100,
+      dealNo: d.dealId || '',
+      merchant: d.merchantName || d.merchant?.legalName || '',
+      merchantState: d.merchantState || d.merchant?.businessState || '',
+      invested: round2(fundedAmount),
+      collected: round2(totalCollected),
+      feesPaid: round2(totalFees),
+      netReturn: round2(netReturn),
+      roi: round2(roi),
       status,
-      pmtsRemaining: status === 'Profit' ? 'Paid Off' : Math.round(remainingPayments * syndPct),
-      dollarRemaining: status === 'Profit' ? 'Paid Off' : Math.round(outstanding * syndPct * 100) / 100,
-      frequency: status === 'Profit' ? 'Paid Off' : status === 'Default' ? '-' : dailyAmt > 0 ? 'Daily' : weeklyAmt > 0 ? 'Weekly' : 'Daily',
-      vintage: deal.vintage || deal.VINTAGE || '',
-      netFunded,
-      rtr: deal.purchased || deal.PURCHASED || 0,
-      totalCollectedBiz: deal.totalCollected || deal.TOTAL_COLLECTED || 0,
-      exposureBiz: deal.exposure || deal.EXPOSURE || 0,
-      paybackFactor: deal.paybackFactor || deal.PAYBACK_FACTOR || 0,
+      pmtsRemaining: status === 'Profit' ? 'Paid Off' : status === 'Default' ? 0 : (d.paymentCount || '—'),
+      dollarRemaining: status === 'Profit' ? 'Paid Off' : round2(outstandingBalance),
+      frequency: status === 'Profit' ? 'Paid Off' : status === 'Default' ? '-' : 'Daily',
+      vintage,
+      // Business-level fields
+      netFunded: round2(netFunded),
+      rtr: round2(purchaseAmount),
+      totalCollectedBiz: round2(totalCollected),
+      exposureBiz: round2(currentExposure),
+      paybackFactor,
+      // Extra info
+      brokerName: d.brokerName || '',
+      isoName: d.iso?.isoName || '',
+      score: d.scoreData?.score || 0,
+      grade: d.scoreData?.grade || '',
+      subStatus: d.subStatus || '',
+      dealType: d.dealType || '',
+      fundedDate: d.fundedDate || '',
     };
   }
 
-  function computeVintageAnalysis(dealPerfs) {
-    const vintageMap = {};
-    for (const d of dealPerfs) {
+  // ============================================================
+  // VINTAGE ANALYSIS
+  // ============================================================
+  function computeVintages(perfs) {
+    const map = {};
+    for (const d of perfs) {
       const v = d.vintage;
       if (!v) continue;
-      if (!vintageMap[v]) {
-        vintageMap[v] = { vintage: v, numDeals: 0, invested: 0, totalCollected: 0, totalFees: 0,
-          netCollections: 0, defaults: 0, remainingRTR: 0, defaultedRTR: 0 };
+      if (!map[v]) {
+        map[v] = { vintage: v, numDeals: 0, invested: 0, totalCollected: 0, totalFees: 0,
+          netCollections: 0, defaults: 0, remainingRTR: 0, defaultedRTR: 0,
+          netFunded: 0, rtr: 0, totalCollectedBiz: 0 };
       }
-      const vm = vintageMap[v];
-      vm.numDeals++;
-      vm.invested += d.invested;
-      vm.totalCollected += d.collected;
-      vm.totalFees += d.feesPaid;
-      vm.netCollections += d.collected - d.feesPaid;
+      const m = map[v];
+      m.numDeals++;
+      m.invested += d.invested;
+      m.totalCollected += d.collected;
+      m.totalFees += d.feesPaid;
+      m.netCollections += d.collected - d.feesPaid;
+      m.netFunded += d.netFunded;
+      m.rtr += d.rtr;
+      m.totalCollectedBiz += d.totalCollectedBiz;
+      const remaining = typeof d.dollarRemaining === 'number' ? d.dollarRemaining : 0;
+      m.remainingRTR += remaining;
       if (d.status === 'Default') {
-        vm.defaults++;
-        vm.defaultedRTR += typeof d.dollarRemaining === 'number' ? d.dollarRemaining : 0;
+        m.defaults++;
+        m.defaultedRTR += remaining;
       }
-      vm.remainingRTR += typeof d.dollarRemaining === 'number' ? d.dollarRemaining : 0;
     }
-    return Object.values(vintageMap)
+
+    return Object.values(map)
       .sort((a, b) => a.vintage.localeCompare(b.vintage))
       .map(v => {
         const collPct = v.invested > 0 ? v.netCollections / v.invested : 0;
-        const moActive = Math.max(0, Math.floor((new Date() - new Date(v.vintage + '-01')) / (1000 * 60 * 60 * 24 * 30.44)));
+        const mo = Math.max(0, Math.floor((new Date() - new Date(v.vintage + '-01')) / (1000 * 60 * 60 * 24 * 30.44)));
         return {
-          ...v,
-          collectionPctNI: collPct,
-          exposure: v.invested - v.netCollections,
-          defaultRate: v.numDeals > 0 ? v.defaults / v.numDeals : 0,
-          defaultPctRTR: v.remainingRTR > 0 ? v.defaultedRTR / v.remainingRTR : 0,
-          monthsActive: moActive,
-          avgMonthlyYield: moActive > 0 ? collPct / moActive : 0,
+          vintage: v.vintage, numDeals: v.numDeals,
+          invested: round2(v.invested), totalCollected: round2(v.totalCollected),
+          totalFees: round2(v.totalFees), netCollections: round2(v.netCollections),
+          collectionPctNI: round2(collPct),
+          remainingRTR: round2(v.remainingRTR), defaultedRTR: round2(v.defaultedRTR),
+          defaultPctRTR: v.remainingRTR > 0 ? round2(v.defaultedRTR / v.remainingRTR) : 0,
+          exposure: round2(v.invested - v.netCollections),
+          defaultRate: v.numDeals > 0 ? round2(v.defaults / v.numDeals) : 0,
+          monthsActive: mo,
+          avgMonthlyYield: mo > 0 ? round2(collPct / mo) : 0,
+          // Business level
+          netFunded: round2(v.netFunded), rtr: round2(v.rtr),
+          totalCollectedBiz: round2(v.totalCollectedBiz),
+          collectionPctNF: v.netFunded > 0 ? round2(v.totalCollectedBiz / v.netFunded) : 0,
+          exposureBiz: round2(Math.max(0, v.netFunded - v.totalCollectedBiz)),
         };
       });
   }
 
-  function computeSummary(dealPerfs) {
-    const totalInvested = dealPerfs.reduce((s, d) => s + d.invested, 0);
-    const totalCollected = dealPerfs.reduce((s, d) => s + d.collected, 0);
-    const totalFees = dealPerfs.reduce((s, d) => s + d.feesPaid, 0);
+  // ============================================================
+  // SUMMARY
+  // ============================================================
+  function computeSummary(perfs, vintages) {
+    const sum = (arr, fn) => arr.reduce((s, d) => s + fn(d), 0);
+    const totalInvested = sum(perfs, d => d.invested);
+    const totalCollected = sum(perfs, d => d.collected);
+    const totalFees = sum(perfs, d => d.feesPaid);
     const netCollections = totalCollected - totalFees;
-    const unreturned = Math.max(totalInvested - totalCollected, 0);
-    const totalNetFunded = dealPerfs.reduce((s, d) => s + d.netFunded, 0);
-    const totalRTR = dealPerfs.reduce((s, d) => s + d.rtr, 0);
-    const totalCollectedBiz = dealPerfs.reduce((s, d) => s + d.totalCollectedBiz, 0);
-    const dealsInProfit = dealPerfs.filter(d => d.status === 'Profit').length;
-    const dealsActive = dealPerfs.filter(d => d.status === 'Active').length;
-    const dealsDefaulted = dealPerfs.filter(d => d.status === 'Default').length;
+    const grossPnL = sum(perfs, d => d.netReturn);
+    const totalNetFunded = sum(perfs, d => d.netFunded);
+    const totalRTR = sum(perfs, d => d.rtr);
+    const totalCollectedBiz = sum(perfs, d => d.totalCollectedBiz);
+    const unreturned = Math.max(0, totalInvested - totalCollected);
+    const profit = perfs.filter(d => d.status === 'Profit').length;
+    const active = perfs.filter(d => d.status === 'Active').length;
+    const defaulted = perfs.filter(d => d.status === 'Default').length;
+
+    const dates = perfs.map(d => d.vintage).filter(Boolean).sort();
 
     return {
-      period: { start: 'Live', end: new Date().toLocaleDateString() },
+      period: { start: dates[0] || 'Live', end: new Date().toLocaleDateString() },
       durationDays: '-',
       totalInvested: Math.round(totalInvested),
-      numDeals: dealPerfs.length,
-      avgDealSize: dealPerfs.length > 0 ? Math.round(totalInvested / dealPerfs.length) : 0,
+      numDeals: perfs.length,
+      avgDealSize: perfs.length > 0 ? Math.round(totalInvested / perfs.length) : 0,
       totalGrossCollections: Math.round(totalCollected),
-      collectionsPctInvested: totalInvested > 0 ? totalCollected / totalInvested : 0,
+      collectionsPctInvested: totalInvested > 0 ? round2(totalCollected / totalInvested) : 0,
       totalFees: Math.round(totalFees),
-      feesPctInvested: totalInvested > 0 ? totalFees / totalInvested : 0,
-      feesPctCollections: totalCollected > 0 ? totalFees / totalCollected : 0,
+      feesPctInvested: totalInvested > 0 ? round2(totalFees / totalInvested) : 0,
+      feesPctCollections: totalCollected > 0 ? round2(totalFees / totalCollected) : 0,
       netCollections: Math.round(netCollections),
       unreturned: Math.round(unreturned),
-      grossPnL: Math.round(netCollections - totalInvested),
-      dealsInProfit, dealsActiveBelowBasis: dealsActive, dealsDefaulted,
-      winRate: dealPerfs.length > 0 ? dealsInProfit / dealPerfs.length : 0,
-      defaultRate: dealPerfs.length > 0 ? dealsDefaulted / dealPerfs.length : 0,
+      grossPnL: Math.round(grossPnL),
+      dealsInProfit: profit,
+      dealsActiveBelowBasis: active,
+      dealsDefaulted: defaulted,
+      winRate: perfs.length > 0 ? round2(profit / perfs.length) : 0,
+      defaultRate: perfs.length > 0 ? round2(defaulted / perfs.length) : 0,
       totalNetFunded: Math.round(totalNetFunded),
       totalRTR: Math.round(totalRTR),
       totalCollectedBiz: Math.round(totalCollectedBiz),
-      collectionPctNF: totalNetFunded > 0 ? totalCollectedBiz / totalNetFunded : 0,
+      collectionPctNF: totalNetFunded > 0 ? round2(totalCollectedBiz / totalNetFunded) : 0,
+      avgPaybackFactor: perfs.length > 0 ? round2(sum(perfs, d => d.paybackFactor) / perfs.length) : 0,
       totalExposure: Math.max(0, Math.round(totalNetFunded - totalCollectedBiz)),
       totalRemainingRTR: Math.round(totalRTR - totalCollectedBiz),
-      externalCapital: 0, reinvestedReturns: 0, totalDeposits: 0, totalWithdrawals: 0,
-      netCapitalDeployed: 0, currentCashBalance: 0, managementFees: 0, residualCommissions: 0,
-      totalMerchantPayments: 0, refiProceeds: 0, balanceTransfersIn: 0, balanceTransfersOut: 0,
-      totalCurrentValue: 0, netProfit: 0, projectedXIRR: 0, cashOnCashMultiple: 0,
+      totalMerchantPayments: Math.round(totalCollected),
+      netProfit: Math.round(grossPnL),
+      unrealizedValue: Math.round(unreturned),
+      pctStillOutstanding: totalInvested > 0 ? round2(unreturned / totalInvested) : 0,
+      // Syndicator ledger fields (not available from deals API)
+      externalCapital: 0, reinvestedReturns: 0, totalDeposits: 0,
+      totalWithdrawals: 0, netCapitalDeployed: 0, currentCashBalance: 0,
+      managementFees: 0, residualCommissions: 0,
+      refiProceeds: 0, balanceTransfersIn: 0, balanceTransfersOut: 0,
+      totalCurrentValue: 0, projectedXIRR: 0, cashOnCashMultiple: 0,
       realizedValue: 0, realizedPnL: 0, realizedROI: 0,
-      unrealizedValue: Math.round(unreturned), pctStillOutstanding: totalInvested > 0 ? unreturned / totalInvested : 0,
-      xirrFullRecovery: 0, xirrTotalLoss: 0, avgPaybackFactor: 0,
-      dailyPctDeals: 0, weeklyPctDeals: 0, dailyAvgDays: 0, weeklyAvgWeeks: 0,
+      xirrFullRecovery: 0, xirrTotalLoss: 0,
+      dailyPctDeals: 0, weeklyPctDeals: 0,
+      dailyAvgDays: 0, weeklyAvgWeeks: 0,
       moIRR_noDefault: 0, annIRR_noDefault: 0, moic_noDefault: 0,
       moIRR_adjusted: 0, annIRR_adjusted: 0, moic_adjusted: 0,
     };
   }
 
+  // ============================================================
+  // MAIN
+  // ============================================================
   try {
     const deals = await getAllDeals();
-    const paymentsByDeal = {};
-    await Promise.all(
-      deals.map(async (deal) => {
-        const dealId = deal.id || deal.dealId;
-        paymentsByDeal[dealId] = await getDealPayments(dealId);
-      })
-    );
+    const dealPerf = deals.map(mapDeal);
+    const vintagesSynd = computeVintages(dealPerf);
+    const summary = computeSummary(dealPerf, vintagesSynd);
 
-    const dealPerf = deals.map(deal => {
-      const dealId = deal.id || deal.dealId;
-      return computeDealPerformance(deal, paymentsByDeal[dealId] || []);
-    });
-
-    const vintagesSynd = computeVintageAnalysis(dealPerf);
-    const summary = computeSummary(dealPerf);
-
+    // Collection curves (approximated from vintage data)
     const curvesPct = vintagesSynd.map(v => ({
       vintage: v.vintage,
-      month0: v.monthsActive >= 0 ? (v.collectionPctNI * 0.05) : null,
-      month1: v.monthsActive >= 1 ? (v.collectionPctNI * 0.35) : null,
-      month2: v.monthsActive >= 2 ? v.collectionPctNI : null,
-      month3: v.monthsActive >= 3 ? v.collectionPctNI : null,
-      month4: v.monthsActive >= 4 ? v.collectionPctNI : null,
-      month5: v.monthsActive >= 5 ? v.collectionPctNI : null,
+      month0: v.monthsActive >= 0 ? round2(v.collectionPctNI * 0.05) : null,
+      month1: v.monthsActive >= 1 ? round2(v.collectionPctNI * 0.35) : null,
+      month2: v.monthsActive >= 2 ? round2(v.collectionPctNI * 0.7) : null,
+      month3: v.monthsActive >= 3 ? round2(v.collectionPctNI * 0.85) : null,
+      month4: v.monthsActive >= 4 ? round2(v.collectionPctNI * 0.95) : null,
+      month5: v.monthsActive >= 5 ? round2(v.collectionPctNI) : null,
     }));
     const curvesDollar = curvesPct.map((c, i) => ({
       vintage: c.vintage,
@@ -221,25 +258,26 @@ export default async function handler(req, res) {
       month5: c.month5 != null ? Math.round(c.month5 * vintagesSynd[i].invested) : null,
     }));
 
-    const vintagesBiz = vintagesSynd.map(v => {
-      const vDeals = dealPerf.filter(d => d.vintage === v.vintage);
-      const nf = Math.round(vDeals.reduce((s, d) => s + d.netFunded, 0));
-      const tc = Math.round(vDeals.reduce((s, d) => s + d.totalCollectedBiz, 0));
-      return {
-        vintage: v.vintage, numDeals: v.numDeals, netFunded: nf,
-        rtr: Math.round(vDeals.reduce((s, d) => s + d.rtr, 0)),
-        totalCollected: tc,
-        collectionPctNF: nf > 0 ? tc / nf : 0,
-        exposure: Math.max(0, nf - tc),
-        defaultRate: v.defaultRate,
-      };
-    });
+    // Business-level vintages
+    const vintagesBiz = vintagesSynd.map(v => ({
+      vintage: v.vintage, numDeals: v.numDeals,
+      netFunded: Math.round(v.netFunded), rtr: Math.round(v.rtr),
+      totalCollected: Math.round(v.totalCollectedBiz),
+      collectionPctNF: v.collectionPctNF,
+      exposure: Math.round(v.exposureBiz),
+      defaultRate: v.defaultRate,
+    }));
 
     res.status(200).json({
       dealPerf, vintagesSynd, curvesPct, curvesDollar, vintagesBiz,
       xirrFlows: [],
       summary,
-      _meta: { fetchedAt: new Date().toISOString(), dealCount: deals.length, source: 'SmartMCA Nexus API (live)' },
+      _meta: {
+        fetchedAt: new Date().toISOString(),
+        dealCount: deals.length,
+        source: 'SmartMCA Nexus API (live)',
+        apiBase: API_BASE,
+      },
     });
   } catch (error) {
     res.status(500).json({ error: 'Portfolio aggregation failed', details: error.message });
