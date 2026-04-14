@@ -10,7 +10,6 @@ export default async function handler(req, res) {
   if (!API_KEY) return res.status(500).json({ error: 'SMARTMCA_API_KEY not configured.' });
 
   try {
-    // Paginate through all contacts
     const syndicators = [];
     let page = 1;
     while (true) {
@@ -18,10 +17,21 @@ export default async function handler(req, res) {
         headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
       });
       if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
-      const data = await resp.json();
-      const contacts = data.data || [];
-      
-      // Filter to syndicators only
+      const raw = await resp.json();
+
+      // Handle both { data: [...] } and { data: { data: [...] } } response shapes
+      let contacts = [];
+      let pagination = null;
+      if (Array.isArray(raw.data)) {
+        contacts = raw.data;
+        pagination = raw.meta?.pagination;
+      } else if (raw.data && Array.isArray(raw.data.data)) {
+        contacts = raw.data.data;
+        pagination = raw.data.meta?.pagination || raw.meta?.pagination;
+      } else if (Array.isArray(raw)) {
+        contacts = raw;
+      }
+
       for (const c of contacts) {
         if (c.type === 'syndicator') {
           syndicators.push({
@@ -38,13 +48,11 @@ export default async function handler(req, res) {
           });
         }
       }
-      
-      const pag = data.meta?.pagination;
-      if (!pag || page >= pag.totalPages) break;
+
+      if (!pagination || page >= (pagination.totalPages || 1)) break;
       page++;
     }
 
-    // Sort by totalInvested descending
     syndicators.sort((a, b) => b.totalInvested - a.totalInvested);
 
     res.status(200).json({ syndicators });

@@ -297,7 +297,9 @@ export default async function handler(req, res) {
     if (syndicatorId) {
       try {
         const contactsResp = await apiFetch('/contacts?limit=100');
-        const contacts = contactsResp.data || [];
+        // Handle both { data: [...] } and { data: { data: [...] } }
+        const contacts = Array.isArray(contactsResp.data) ? contactsResp.data
+          : Array.isArray(contactsResp.data?.data) ? contactsResp.data.data : [];
         const contact = contacts.find(c => c.id === syndicatorId);
         if (contact) {
           syndicatorInfo = {
@@ -310,7 +312,11 @@ export default async function handler(req, res) {
 
       try {
         const sub = await apiFetch(`/accounting/reports/subledger/syndicator/${syndicatorId}`);
-        ledgerData = parseSubledger(sub.data || [], sub.currentBalance || 0);
+        // Handle both { data: [...], currentBalance } and { data: { data: [...], currentBalance } }
+        const subEntries = Array.isArray(sub.data) ? sub.data
+          : Array.isArray(sub.data?.data) ? sub.data.data : [];
+        const subBalance = sub.currentBalance ?? sub.data?.currentBalance ?? 0;
+        ledgerData = parseSubledger(subEntries, subBalance);
       } catch (e) { /* continue */ }
     }
 
