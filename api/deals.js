@@ -1,11 +1,10 @@
 // Vercel Serverless Function: /api/deals
 // Proxies requests to SmartMCA Nexus API with server-side API key
 
-const API_KEY = process.env.SMARTMCA_API_KEY;
-const API_BASE = process.env.SMARTMCA_API_BASE || 'https://api.nexus.smartmca.com/api/public/v1';
-
 export default async function handler(req, res) {
-  // CORS headers
+  const API_KEY = process.env.SMARTMCA_API_KEY;
+  const API_BASE = process.env.SMARTMCA_API_BASE || 'https://api.nexus.smartmca.com/api/public/v1';
+
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -17,7 +16,6 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Forward query params to SmartMCA
     const queryString = new URLSearchParams(req.query).toString();
     const url = `${API_BASE}/deals${queryString ? '?' + queryString : ''}`;
 
