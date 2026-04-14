@@ -1,5 +1,6 @@
 // Vercel Serverless Function: /api/portfolio
-// Maps actual SmartMCA staging API fields to dashboard structure
+// Combines /deals + /accounting/reports/subledger/syndicator/{id} + /contacts
+// Accepts ?syndicatorId= to scope to a specific syndicator
 
 export default async function handler(req, res) {
   const API_KEY = process.env.SMARTMCA_API_KEY;
@@ -9,9 +10,10 @@ export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
   if (!API_KEY) return res.status(500).json({ error: 'SMARTMCA_API_KEY not configured.' });
 
-  async function apiFetch(path, params = {}) {
-    const qs = new URLSearchParams(params).toString();
-    const url = `${API_BASE}${path}${qs ? '?' + qs : ''}`;
+  const { syndicatorId } = req.query;
+
+  async function apiFetch(path) {
+    const url = `${API_BASE}${path}`;
     const resp = await fetch(url, {
       headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
     });
@@ -19,12 +21,11 @@ export default async function handler(req, res) {
     return resp.json();
   }
 
-  // Page-based pagination (meta.pagination.page, totalPages)
   async function getAllDeals() {
     const deals = [];
     let page = 1;
     while (true) {
-      const resp = await apiFetch('/deals', { limit: '100', page: String(page) });
+      const resp = await apiFetch(`/deals?limit=100&page=${page}`);
       if (resp.data) deals.push(...resp.data);
       const pag = resp.meta?.pagination;
       if (!pag || page >= pag.totalPages) break;
@@ -33,7 +34,6 @@ export default async function handler(req, res) {
     return deals;
   }
 
-  // All numeric fields from SmartMCA come as strings
   function num(v) {
     if (v == null || v === '') return 0;
     const n = parseFloat(v);
@@ -48,70 +48,146 @@ export default async function handler(req, res) {
 
   function round2(v) { return Math.round(v * 100) / 100; }
 
-  // ============================================================
-  // MAP EACH DEAL — uses actual SmartMCA field names
-  // ============================================================
   function mapDeal(d) {
     const fundedAmount = num(d.fundedAmount);
     const netFunded = num(d.netFunded);
-    const purchaseAmount = num(d.purchaseAmount);   // = RTR
+    const purchaseAmount = num(d.purchaseAmount);
     const totalCollected = num(d.totalCollected);
     const outstandingBalance = num(d.outstandingBalance);
     const currentExposure = num(d.currentExposure);
     const pnl = num(d.pAndL);
-    const bankFees = num(d.bankFees);
-    const otherFees = num(d.otherFees);
+    const bankFees = num(d.bankFees) + num(d.otherFees);
     const paybackFactor = num(d.paybackFactor);
     const vintage = toVintage(d.fundedDate);
 
-    // Status: API gives "active", "closed", "defaulted"
     let status;
-    if (d.status === 'defaulted') {
-      status = 'Default';
-    } else if (d.status === 'closed') {
-      status = 'Profit';  // closed deals have been paid off
-    } else {
-      status = 'Active';  // active — may be above or below basis
-    }
-
-    const totalFees = bankFees + otherFees;
-    const netReturn = pnl;  // pAndL already accounts for fees
-    const roi = netFunded > 0 ? netReturn / netFunded : 0;
+    if (d.status === 'defaulted') status = 'Default';
+    else if (d.status === 'closed') status = 'Profit';
+    else status = 'Active';
 
     return {
       dealNo: d.dealId || '',
+      internalId: d.id || '',
       merchant: d.merchantName || d.merchant?.legalName || '',
-      merchantState: d.merchantState || d.merchant?.businessState || '',
+      merchantState: d.merchantState || '',
       invested: round2(fundedAmount),
       collected: round2(totalCollected),
-      feesPaid: round2(totalFees),
-      netReturn: round2(netReturn),
-      roi: round2(roi),
+      feesPaid: round2(bankFees),
+      netReturn: round2(pnl),
+      roi: netFunded > 0 ? round2(pnl / netFunded) : 0,
       status,
-      pmtsRemaining: status === 'Profit' ? 'Paid Off' : status === 'Default' ? 0 : (d.paymentCount || '—'),
+      pmtsRemaining: status === 'Profit' ? 'Paid Off' : status === 'Default' ? 0 : '—',
       dollarRemaining: status === 'Profit' ? 'Paid Off' : round2(outstandingBalance),
       frequency: status === 'Profit' ? 'Paid Off' : status === 'Default' ? '-' : 'Daily',
       vintage,
-      // Business-level fields
       netFunded: round2(netFunded),
       rtr: round2(purchaseAmount),
       totalCollectedBiz: round2(totalCollected),
       exposureBiz: round2(currentExposure),
       paybackFactor,
-      // Extra info
       brokerName: d.brokerName || '',
       isoName: d.iso?.isoName || '',
       score: d.scoreData?.score || 0,
       grade: d.scoreData?.grade || '',
-      subStatus: d.subStatus || '',
-      dealType: d.dealType || '',
       fundedDate: d.fundedDate || '',
     };
   }
 
-  // ============================================================
-  // VINTAGE ANALYSIS
-  // ============================================================
+  function parseSubledger(entries, currentBalance) {
+    const ledger = entries.filter(e => e.account === 'Syndicator Distributions Payable');
+
+    let totalDeposits = 0;
+    let totalWithdrawals = 0;
+    let totalInvestments = 0;
+    let totalAllocations = 0;
+    let totalCostSharing = 0;
+    let totalEarlyPayoff = 0;
+
+    const dailyFlows = {};
+    const flowsByDate = {};
+
+    for (const e of ledger) {
+      const desc = (e.description || '').toLowerCase();
+      const date = (e.date || '').slice(0, 10);
+      const credit = e.credit || 0;
+      const debit = e.debit || 0;
+
+      if (!dailyFlows[date]) dailyFlows[date] = { deposits: 0, withdrawals: 0, allocations: 0, fees: 0 };
+
+      if (desc.includes('syndicator deposit:')) {
+        totalDeposits += credit;
+        dailyFlows[date].deposits += credit;
+        if (!flowsByDate[date]) flowsByDate[date] = 0;
+        flowsByDate[date] -= credit;
+      } else if (desc.includes('syndicator withdrawal:')) {
+        totalWithdrawals += debit;
+        dailyFlows[date].withdrawals += debit;
+        if (!flowsByDate[date]) flowsByDate[date] = 0;
+        flowsByDate[date] += debit;
+      } else if (desc.includes('syndicator investment:')) {
+        totalInvestments += credit;
+      } else if (desc.includes('syndicator allocation:')) {
+        totalAllocations += credit;
+        if (desc.includes('early payoff') || desc.includes('early partial payoff')) {
+          totalEarlyPayoff += credit;
+        }
+        dailyFlows[date].allocations += credit;
+      } else if (desc.includes('cost-sharing deductions:')) {
+        totalCostSharing += debit;
+        dailyFlows[date].fees += debit;
+      }
+    }
+
+    // XIRR flows
+    const xirrFlows = [];
+    const sortedDates = Object.keys(flowsByDate).sort();
+    for (const date of sortedDates) {
+      const amt = round2(flowsByDate[date]);
+      if (amt !== 0) {
+        xirrFlows.push({
+          date, amount: amt,
+          type: amt < 0 ? 'Deposit' : 'Withdrawal',
+          description: amt < 0 ? 'Syndicator Deposit' : 'Syndicator Payout',
+        });
+      }
+    }
+    if (currentBalance > 0) {
+      xirrFlows.push({
+        date: new Date().toISOString().slice(0, 10),
+        amount: round2(currentBalance),
+        type: 'Current Balance',
+        description: 'Cash on hand (available now)',
+      });
+    }
+
+    // Cash flow chart
+    const cashFlowChart = [];
+    let cumulative = 0;
+    for (const date of Object.keys(dailyFlows).sort()) {
+      const df = dailyFlows[date];
+      cumulative += df.deposits + df.allocations - df.withdrawals - df.fees;
+      cashFlowChart.push({
+        date: date.slice(5),
+        deposits: round2(df.deposits), withdrawals: round2(df.withdrawals),
+        allocations: round2(df.allocations), fees: round2(df.fees),
+        cumulative: round2(cumulative),
+      });
+    }
+
+    return {
+      totalDeposits: round2(totalDeposits),
+      totalWithdrawals: round2(totalWithdrawals),
+      totalInvestments: round2(totalInvestments),
+      totalAllocations: round2(totalAllocations),
+      totalCostSharing: round2(totalCostSharing),
+      totalEarlyPayoff: round2(totalEarlyPayoff),
+      netCollections: round2(totalAllocations - totalCostSharing),
+      currentCashBalance: round2(currentBalance || 0),
+      xirrFlows,
+      cashFlowChart,
+    };
+  }
+
   function computeVintages(perfs) {
     const map = {};
     for (const d of perfs) {
@@ -123,56 +199,39 @@ export default async function handler(req, res) {
           netFunded: 0, rtr: 0, totalCollectedBiz: 0 };
       }
       const m = map[v];
-      m.numDeals++;
-      m.invested += d.invested;
-      m.totalCollected += d.collected;
-      m.totalFees += d.feesPaid;
-      m.netCollections += d.collected - d.feesPaid;
-      m.netFunded += d.netFunded;
-      m.rtr += d.rtr;
-      m.totalCollectedBiz += d.totalCollectedBiz;
+      m.numDeals++; m.invested += d.invested; m.totalCollected += d.collected;
+      m.totalFees += d.feesPaid; m.netCollections += d.collected - d.feesPaid;
+      m.netFunded += d.netFunded; m.rtr += d.rtr; m.totalCollectedBiz += d.totalCollectedBiz;
       const remaining = typeof d.dollarRemaining === 'number' ? d.dollarRemaining : 0;
       m.remainingRTR += remaining;
-      if (d.status === 'Default') {
-        m.defaults++;
-        m.defaultedRTR += remaining;
-      }
+      if (d.status === 'Default') { m.defaults++; m.defaultedRTR += remaining; }
     }
-
-    return Object.values(map)
-      .sort((a, b) => a.vintage.localeCompare(b.vintage))
-      .map(v => {
-        const collPct = v.invested > 0 ? v.netCollections / v.invested : 0;
-        const mo = Math.max(0, Math.floor((new Date() - new Date(v.vintage + '-01')) / (1000 * 60 * 60 * 24 * 30.44)));
-        return {
-          vintage: v.vintage, numDeals: v.numDeals,
-          invested: round2(v.invested), totalCollected: round2(v.totalCollected),
-          totalFees: round2(v.totalFees), netCollections: round2(v.netCollections),
-          collectionPctNI: round2(collPct),
-          remainingRTR: round2(v.remainingRTR), defaultedRTR: round2(v.defaultedRTR),
-          defaultPctRTR: v.remainingRTR > 0 ? round2(v.defaultedRTR / v.remainingRTR) : 0,
-          exposure: round2(v.invested - v.netCollections),
-          defaultRate: v.numDeals > 0 ? round2(v.defaults / v.numDeals) : 0,
-          monthsActive: mo,
-          avgMonthlyYield: mo > 0 ? round2(collPct / mo) : 0,
-          // Business level
-          netFunded: round2(v.netFunded), rtr: round2(v.rtr),
-          totalCollectedBiz: round2(v.totalCollectedBiz),
-          collectionPctNF: v.netFunded > 0 ? round2(v.totalCollectedBiz / v.netFunded) : 0,
-          exposureBiz: round2(Math.max(0, v.netFunded - v.totalCollectedBiz)),
-        };
-      });
+    return Object.values(map).sort((a, b) => a.vintage.localeCompare(b.vintage)).map(v => {
+      const collPct = v.invested > 0 ? v.netCollections / v.invested : 0;
+      const mo = Math.max(0, Math.floor((new Date() - new Date(v.vintage + '-01')) / (1000 * 60 * 60 * 24 * 30.44)));
+      return {
+        vintage: v.vintage, numDeals: v.numDeals,
+        invested: round2(v.invested), totalCollected: round2(v.totalCollected),
+        totalFees: round2(v.totalFees), netCollections: round2(v.netCollections),
+        collectionPctNI: round2(collPct),
+        remainingRTR: round2(v.remainingRTR), defaultedRTR: round2(v.defaultedRTR),
+        defaultPctRTR: v.remainingRTR > 0 ? round2(v.defaultedRTR / v.remainingRTR) : 0,
+        exposure: round2(v.invested - v.netCollections),
+        defaultRate: v.numDeals > 0 ? round2(v.defaults / v.numDeals) : 0,
+        monthsActive: mo, avgMonthlyYield: mo > 0 ? round2(collPct / mo) : 0,
+        netFunded: round2(v.netFunded), rtr: round2(v.rtr),
+        totalCollectedBiz: round2(v.totalCollectedBiz),
+        collectionPctNF: v.netFunded > 0 ? round2(v.totalCollectedBiz / v.netFunded) : 0,
+        exposureBiz: round2(Math.max(0, v.netFunded - v.totalCollectedBiz)),
+      };
+    });
   }
 
-  // ============================================================
-  // SUMMARY
-  // ============================================================
-  function computeSummary(perfs, vintages) {
+  function computeSummary(perfs, vintages, ld, synInfo) {
     const sum = (arr, fn) => arr.reduce((s, d) => s + fn(d), 0);
-    const totalInvested = sum(perfs, d => d.invested);
+    const totalInvested = synInfo?.totalInvested || sum(perfs, d => d.invested);
     const totalCollected = sum(perfs, d => d.collected);
     const totalFees = sum(perfs, d => d.feesPaid);
-    const netCollections = totalCollected - totalFees;
     const grossPnL = sum(perfs, d => d.netReturn);
     const totalNetFunded = sum(perfs, d => d.netFunded);
     const totalRTR = sum(perfs, d => d.rtr);
@@ -181,64 +240,83 @@ export default async function handler(req, res) {
     const profit = perfs.filter(d => d.status === 'Profit').length;
     const active = perfs.filter(d => d.status === 'Active').length;
     const defaulted = perfs.filter(d => d.status === 'Default').length;
-
-    const dates = perfs.map(d => d.vintage).filter(Boolean).sort();
+    const dates = perfs.map(d => d.fundedDate).filter(Boolean).sort();
+    const l = ld || {};
 
     return {
-      period: { start: dates[0] || 'Live', end: new Date().toLocaleDateString() },
-      durationDays: '-',
-      totalInvested: Math.round(totalInvested),
-      numDeals: perfs.length,
+      syndicatorName: synInfo?.name || 'All Syndicators',
+      syndicatorId: synInfo?.id || '',
+      period: { start: dates[0] ? new Date(dates[0]).toLocaleDateString() : 'N/A', end: new Date().toLocaleDateString() },
+      durationDays: dates[0] ? Math.floor((new Date() - new Date(dates[0])) / 86400000) : 0,
+      totalDeposits: l.totalDeposits || 0, externalCapital: l.totalDeposits || 0,
+      reinvestedReturns: 0, totalWithdrawals: l.totalWithdrawals || 0,
+      netCapitalDeployed: round2((l.totalDeposits || 0) - (l.totalWithdrawals || 0)),
+      currentCashBalance: l.currentCashBalance || synInfo?.runningBalance || 0,
+      totalInvested: Math.round(totalInvested), numDeals: perfs.length,
       avgDealSize: perfs.length > 0 ? Math.round(totalInvested / perfs.length) : 0,
-      totalGrossCollections: Math.round(totalCollected),
-      collectionsPctInvested: totalInvested > 0 ? round2(totalCollected / totalInvested) : 0,
-      totalFees: Math.round(totalFees),
-      feesPctInvested: totalInvested > 0 ? round2(totalFees / totalInvested) : 0,
-      feesPctCollections: totalCollected > 0 ? round2(totalFees / totalCollected) : 0,
-      netCollections: Math.round(netCollections),
-      unreturned: Math.round(unreturned),
-      grossPnL: Math.round(grossPnL),
-      dealsInProfit: profit,
-      dealsActiveBelowBasis: active,
-      dealsDefaulted: defaulted,
+      totalGrossCollections: Math.round(l.totalAllocations || totalCollected),
+      collectionsPctInvested: totalInvested > 0 ? round2((l.totalAllocations || totalCollected) / totalInvested) : 0,
+      totalMerchantPayments: Math.round(l.totalAllocations || totalCollected),
+      refiProceeds: 0, balanceTransfersIn: 0, balanceTransfersOut: 0,
+      managementFees: 0, residualCommissions: 0,
+      totalFees: Math.round(l.totalCostSharing || totalFees),
+      feesPctInvested: totalInvested > 0 ? round2((l.totalCostSharing || totalFees) / totalInvested) : 0,
+      feesPctCollections: (l.totalAllocations || totalCollected) > 0 ? round2((l.totalCostSharing || totalFees) / (l.totalAllocations || totalCollected)) : 0,
+      netCollections: Math.round(l.netCollections || (totalCollected - totalFees)),
+      unreturned: Math.round(unreturned), grossPnL: Math.round(grossPnL),
+      totalCurrentValue: Math.round((l.currentCashBalance || 0) + unreturned),
+      netProfit: Math.round((l.currentCashBalance || 0) + unreturned - totalInvested),
+      projectedXIRR: 0,
+      cashOnCashMultiple: totalInvested > 0 ? round2(((l.currentCashBalance || 0) + unreturned + (l.totalWithdrawals || 0)) / totalInvested) : 0,
+      dealsInProfit: profit, dealsActiveBelowBasis: active, dealsDefaulted: defaulted,
       winRate: perfs.length > 0 ? round2(profit / perfs.length) : 0,
       defaultRate: perfs.length > 0 ? round2(defaulted / perfs.length) : 0,
-      totalNetFunded: Math.round(totalNetFunded),
-      totalRTR: Math.round(totalRTR),
+      realizedValue: 0, realizedPnL: 0, realizedROI: 0,
+      unrealizedValue: Math.round(unreturned),
+      pctStillOutstanding: totalInvested > 0 ? round2(unreturned / totalInvested) : 0,
+      xirrFullRecovery: 0, xirrTotalLoss: 0,
+      totalNetFunded: Math.round(totalNetFunded), totalRTR: Math.round(totalRTR),
       totalCollectedBiz: Math.round(totalCollectedBiz),
       collectionPctNF: totalNetFunded > 0 ? round2(totalCollectedBiz / totalNetFunded) : 0,
       avgPaybackFactor: perfs.length > 0 ? round2(sum(perfs, d => d.paybackFactor) / perfs.length) : 0,
       totalExposure: Math.max(0, Math.round(totalNetFunded - totalCollectedBiz)),
       totalRemainingRTR: Math.round(totalRTR - totalCollectedBiz),
-      totalMerchantPayments: Math.round(totalCollected),
-      netProfit: Math.round(grossPnL),
-      unrealizedValue: Math.round(unreturned),
-      pctStillOutstanding: totalInvested > 0 ? round2(unreturned / totalInvested) : 0,
-      // Syndicator ledger fields (not available from deals API)
-      externalCapital: 0, reinvestedReturns: 0, totalDeposits: 0,
-      totalWithdrawals: 0, netCapitalDeployed: 0, currentCashBalance: 0,
-      managementFees: 0, residualCommissions: 0,
-      refiProceeds: 0, balanceTransfersIn: 0, balanceTransfersOut: 0,
-      totalCurrentValue: 0, projectedXIRR: 0, cashOnCashMultiple: 0,
-      realizedValue: 0, realizedPnL: 0, realizedROI: 0,
-      xirrFullRecovery: 0, xirrTotalLoss: 0,
-      dailyPctDeals: 0, weeklyPctDeals: 0,
-      dailyAvgDays: 0, weeklyAvgWeeks: 0,
+      dailyPctDeals: 0, weeklyPctDeals: 0, dailyAvgDays: 0, weeklyAvgWeeks: 0,
       moIRR_noDefault: 0, annIRR_noDefault: 0, moic_noDefault: 0,
       moIRR_adjusted: 0, annIRR_adjusted: 0, moic_adjusted: 0,
     };
   }
 
-  // ============================================================
-  // MAIN
-  // ============================================================
   try {
     const deals = await getAllDeals();
     const dealPerf = deals.map(mapDeal);
-    const vintagesSynd = computeVintages(dealPerf);
-    const summary = computeSummary(dealPerf, vintagesSynd);
 
-    // Collection curves (approximated from vintage data)
+    let syndicatorInfo = null;
+    let ledgerData = null;
+
+    if (syndicatorId) {
+      try {
+        const contactsResp = await apiFetch('/contacts?limit=100');
+        const contacts = contactsResp.data || [];
+        const contact = contacts.find(c => c.id === syndicatorId);
+        if (contact) {
+          syndicatorInfo = {
+            id: contact.id, name: contact.name,
+            totalInvested: contact.details?.totalInvested || 0,
+            runningBalance: contact.details?.runningBalance || 0,
+          };
+        }
+      } catch (e) { /* continue */ }
+
+      try {
+        const sub = await apiFetch(`/accounting/reports/subledger/syndicator/${syndicatorId}`);
+        ledgerData = parseSubledger(sub.data || [], sub.currentBalance || 0);
+      } catch (e) { /* continue */ }
+    }
+
+    const vintagesSynd = computeVintages(dealPerf);
+    const summary = computeSummary(dealPerf, vintagesSynd, ledgerData, syndicatorInfo);
+
     const curvesPct = vintagesSynd.map(v => ({
       vintage: v.vintage,
       month0: v.monthsActive >= 0 ? round2(v.collectionPctNI * 0.05) : null,
@@ -257,26 +335,21 @@ export default async function handler(req, res) {
       month4: c.month4 != null ? Math.round(c.month4 * vintagesSynd[i].invested) : null,
       month5: c.month5 != null ? Math.round(c.month5 * vintagesSynd[i].invested) : null,
     }));
-
-    // Business-level vintages
     const vintagesBiz = vintagesSynd.map(v => ({
-      vintage: v.vintage, numDeals: v.numDeals,
-      netFunded: Math.round(v.netFunded), rtr: Math.round(v.rtr),
-      totalCollected: Math.round(v.totalCollectedBiz),
-      collectionPctNF: v.collectionPctNF,
-      exposure: Math.round(v.exposureBiz),
-      defaultRate: v.defaultRate,
+      vintage: v.vintage, numDeals: v.numDeals, netFunded: Math.round(v.netFunded),
+      rtr: Math.round(v.rtr), totalCollected: Math.round(v.totalCollectedBiz),
+      collectionPctNF: v.collectionPctNF, exposure: Math.round(v.exposureBiz), defaultRate: v.defaultRate,
     }));
 
     res.status(200).json({
       dealPerf, vintagesSynd, curvesPct, curvesDollar, vintagesBiz,
-      xirrFlows: [],
+      xirrFlows: ledgerData?.xirrFlows || [],
+      cashFlowChart: ledgerData?.cashFlowChart || [],
       summary,
       _meta: {
-        fetchedAt: new Date().toISOString(),
-        dealCount: deals.length,
-        source: 'SmartMCA Nexus API (live)',
-        apiBase: API_BASE,
+        fetchedAt: new Date().toISOString(), dealCount: deals.length,
+        syndicatorId: syndicatorId || null, syndicatorName: syndicatorInfo?.name || null,
+        hasSubledger: !!ledgerData, source: 'SmartMCA Nexus API (live)',
       },
     });
   } catch (error) {

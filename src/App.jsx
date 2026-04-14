@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, AreaChart, Area } from "recharts";
 import { usePortfolio } from "./hooks/usePortfolio.js";
 import { LOGO } from "./logo.js";
@@ -17,7 +17,7 @@ const fmt = (v, type = "currency") => {
 
 const clr = (v) => v > 0 ? "#166534" : v < 0 ? "#CC0000" : "#084372";
 
-const SYNDICATORS = ["LMJS Capital"];
+// Syndicators loaded from API
 
 // --- Components ---
 const KpiCard = ({ label, value, sub, accent }) => (
@@ -557,8 +557,7 @@ function SyndicatorPage({ DATA }) {
 // --- Main App ---
 export default function App() {
   const [page, setPage] = useState("overview");
-  const [selectedSynd, setSelectedSynd] = useState("LMJS Capital");
-  const { data: DATA, loading, error, source, refresh } = usePortfolio();
+  const { data: DATA, loading, error, source, refresh, syndicators, selectedSyndicatorId, selectSyndicator } = usePortfolio();
 
   if (loading) {
     return (
@@ -586,6 +585,7 @@ export default function App() {
   }
 
   const s = DATA.summary || {};
+  const selectedSyndName = syndicators.find(x => x.id === selectedSyndicatorId)?.name || 'Select Syndicator';
 
   return (
     <div style={{ minHeight: "100vh", background: "#EFF8FF", color: "#052B4C", fontFamily: "'Inria Sans', -apple-system, sans-serif" }}>
@@ -606,11 +606,13 @@ export default function App() {
             <button onClick={() => setPage("syndicator")} style={{ padding: "8px 20px", borderRadius: 8, border: "none", background: page === "syndicator" ? "rgba(5,150,242,0.2)" : "transparent", color: page === "syndicator" ? "#78CBFF" : "#B7E2FF", cursor: "pointer", fontWeight: 600, fontSize: 13, fontFamily: "'Inria Sans'" }}>Syndicator View</button>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            {page === "syndicator" && (
-              <select value={selectedSynd} onChange={e => setSelectedSynd(e.target.value)} style={{ background: "#084372", color: "#B7E2FF", border: "1px solid #0596F2", borderRadius: 8, padding: "6px 12px", fontSize: 13, fontFamily: "'Inria Sans'" }}>
-                {SYNDICATORS.map(s => <option key={s} value={s}>{s}</option>)}
-              </select>
-            )}
+            <select value={selectedSyndicatorId || ''} onChange={e => selectSyndicator(e.target.value)} style={{ background: "#084372", color: "#B7E2FF", border: "1px solid #0596F2", borderRadius: 8, padding: "6px 12px", fontSize: 13, fontFamily: "'Inria Sans'", maxWidth: 220 }}>
+              {syndicators.map(syn => (
+                <option key={syn.id} value={syn.id}>
+                  {syn.name}{syn.totalInvested > 0 ? ` ($${Math.round(syn.totalInvested / 1000)}k)` : ''}
+                </option>
+              ))}
+            </select>
             <button onClick={refresh} title="Refresh data" style={{ background: "none", border: "1px solid #0596F2", borderRadius: 8, padding: "6px 10px", cursor: "pointer", color: "#78CBFF", fontSize: 12, fontFamily: "'Inria Sans'" }}>↻</button>
           </div>
         </div>
@@ -618,11 +620,13 @@ export default function App() {
 
       {/* Subheader */}
       <div style={{ background: "#ffffff", borderBottom: "1px solid #DFF0FF", padding: "12px 32px" }}>
-        <div style={{ maxWidth: 1400, margin: "0 auto", display: "flex", gap: 32, fontSize: 12, color: "#5a7a9a" }}>
+        <div style={{ maxWidth: 1400, margin: "0 auto", display: "flex", gap: 32, fontSize: 12, color: "#5a7a9a", flexWrap: "wrap" }}>
+          <span>Syndicator: <b style={{ color: "#084372" }}>{s.syndicatorName || selectedSyndName}</b></span>
           <span>Period: <b style={{ color: "#084372" }}>{s.period?.start || '—'} — {s.period?.end || '—'}</b></span>
           <span>Duration: <b style={{ color: "#084372" }}>{s.durationDays || '—'} days</b></span>
           <span>Deals: <b style={{ color: "#084372" }}>{s.numDeals || 0}</b></span>
           <span>Data: <b style={{ color: source === 'live' ? "#166534" : "#FD8E3A" }}>{source === 'live' ? 'Live API' : 'Sample Data'}</b></span>
+          {DATA._meta?.hasSubledger && <span style={{ color: "#166534" }}>Subledger: Connected</span>}
           {error && <span style={{ color: "#CC0000" }}>API: {error}</span>}
         </div>
       </div>
