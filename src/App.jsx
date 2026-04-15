@@ -557,7 +557,8 @@ function SyndicatorPage({ DATA }) {
 // --- Main App ---
 export default function App() {
   const [page, setPage] = useState("overview");
-  const { data: DATA, loading, error, source, refresh, syndicators, selectedSyndicatorId, selectSyndicator } = usePortfolio();
+  const { portfolioData, syndicatorData, loading, error, source, refresh, syndicators, selectedSyndicatorId, selectSyndicator } = usePortfolio();
+  const DATA = page === "overview" ? portfolioData : syndicatorData;
 
   if (loading) {
     return (
@@ -606,13 +607,15 @@ export default function App() {
             <button onClick={() => setPage("syndicator")} style={{ padding: "8px 20px", borderRadius: 8, border: "none", background: page === "syndicator" ? "rgba(5,150,242,0.2)" : "transparent", color: page === "syndicator" ? "#78CBFF" : "#B7E2FF", cursor: "pointer", fontWeight: 600, fontSize: 13, fontFamily: "'Inria Sans'" }}>Syndicator View</button>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <select value={selectedSyndicatorId || ''} onChange={e => selectSyndicator(e.target.value)} style={{ background: "#084372", color: "#B7E2FF", border: "1px solid #0596F2", borderRadius: 8, padding: "6px 12px", fontSize: 13, fontFamily: "'Inria Sans'", maxWidth: 220 }}>
-              {syndicators.map(syn => (
-                <option key={syn.id} value={syn.id}>
-                  {syn.name}{syn.totalInvested > 0 ? ` ($${Math.round(syn.totalInvested / 1000)}k)` : ''}
-                </option>
-              ))}
-            </select>
+            {page === "syndicator" && (
+              <select value={selectedSyndicatorId || ''} onChange={e => selectSyndicator(e.target.value)} style={{ background: "#084372", color: "#B7E2FF", border: "1px solid #0596F2", borderRadius: 8, padding: "6px 12px", fontSize: 13, fontFamily: "'Inria Sans'", maxWidth: 220 }}>
+                {syndicators.map(syn => (
+                  <option key={syn.id} value={syn.id}>
+                    {syn.name}{syn.totalInvested > 0 ? ` ($${Math.round(syn.totalInvested / 1000)}k)` : ''}
+                  </option>
+                ))}
+              </select>
+            )}
             <button onClick={refresh} title="Refresh data" style={{ background: "none", border: "1px solid #0596F2", borderRadius: 8, padding: "6px 10px", cursor: "pointer", color: "#78CBFF", fontSize: 12, fontFamily: "'Inria Sans'" }}>↻</button>
           </div>
         </div>
@@ -621,7 +624,7 @@ export default function App() {
       {/* Subheader */}
       <div style={{ background: "#ffffff", borderBottom: "1px solid #DFF0FF", padding: "12px 32px" }}>
         <div style={{ maxWidth: 1400, margin: "0 auto", display: "flex", gap: 32, fontSize: 12, color: "#5a7a9a", flexWrap: "wrap" }}>
-          <span>Syndicator: <b style={{ color: "#084372" }}>{s.syndicatorName || selectedSyndName}</b></span>
+          <span>Syndicator: <b style={{ color: "#084372" }}>{page === "overview" ? `All (${s.aggSyndicatorCount || syndicators.length})` : (s.syndicatorName || selectedSyndName)}</b></span>
           <span>Period: <b style={{ color: "#084372" }}>{s.period?.start || '—'} — {s.period?.end || '—'}</b></span>
           <span>Duration: <b style={{ color: "#084372" }}>{s.durationDays || '—'} days</b></span>
           <span>Deals: <b style={{ color: "#084372" }}>{s.numDeals || 0}</b></span>
@@ -633,7 +636,7 @@ export default function App() {
 
       {/* Body */}
       <div style={{ maxWidth: 1400, margin: "0 auto", padding: "32px 32px 64px" }}>
-        {page === "overview" ? <OverviewPage DATA={DATA} /> : <SyndicatorPage DATA={DATA} />}
+        {page === "overview" ? <OverviewPage DATA={portfolioData || DATA} /> : <SyndicatorPage DATA={syndicatorData || DATA} />}
       </div>
 
       {/* Footer */}

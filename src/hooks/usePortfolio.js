@@ -4,7 +4,9 @@ import { fetchPortfolio, fetchSyndicators } from '../api.js';
 import { FALLBACK_DATA } from '../fallback-data.js';
 
 export function usePortfolio() {
-  const [data, setData] = useState(null);
+  // Two separate data stores
+  const [portfolioData, setPortfolioData] = useState(null);   // funder-wide (no syndicator)
+  const [syndicatorData, setSyndicatorData] = useState(null);  // syndicator-specific (with subledger)
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [source, setSource] = useState(null);
@@ -21,13 +23,11 @@ export function usePortfolio() {
       try {
         const list = await fetchSyndicators();
         setSyndicators(list);
-        // Auto-select the first syndicator with real investment
         const first = list.find(s => s.totalInvested > 100);
         if (first) setSelectedSyndicatorId(first.id);
       } catch (err) {
         console.warn('Failed to load syndicators:', err.message);
-        // Fallback syndicators
-        setSyndicators([{ id: 'fallback', name: 'LMJS Capital (Demo)', totalInvested: 402430 }]);
+        setSyndicators([{ id: 'fallback', name: 'Demo Syndicator', totalInvested: 0 }]);
       } finally {
         setSyndicatorsLoading(false);
       }
@@ -35,24 +35,33 @@ export function usePortfolio() {
     loadSyndicators();
   }, []);
 
-  // Load portfolio when syndicator changes
+  // Load BOTH datasets: portfolio (no syndicator) + syndicator-specific
   useEffect(() => {
-    if (syndicatorsLoading) return; // wait for syndicators to load first
+    if (syndicatorsLoading) return;
 
     let cancelled = false;
     async function load() {
       setLoading(true);
       try {
-        const result = await fetchPortfolio(selectedSyndicatorId);
+        // Fetch both in parallel
+        const [portfolioResult, syndicatorResult] = await Promise.all([
+          fetchPortfolio(null),                    // Portfolio Overview: no syndicator filter
+          selectedSyndicatorId
+            ? fetchPortfolio(selectedSyndicatorId)  // Syndicator View: with subledger
+            : Promise.resolve(null),
+        ]);
+
         if (!cancelled) {
-          setData(result);
+          setPortfolioData(portfolioResult);
+          setSyndicatorData(syndicatorResult || portfolioResult);
           setSource('live');
           setError(null);
         }
       } catch (err) {
-        console.warn('API fetch failed, using fallback data:', err.message);
+        console.warn('API fetch failed, using fallback:', err.message);
         if (!cancelled) {
-          setData(FALLBACK_DATA);
+          setPortfolioData(FALLBACK_DATA);
+          setSyndicatorData(FALLBACK_DATA);
           setSource('fallback');
           setError(err.message);
         }
@@ -67,8 +76,12 @@ export function usePortfolio() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const result = await fetchPortfolio(selectedSyndicatorId);
-      setData(result);
+      const [portfolioResult, syndicatorResult] = await Promise.all([
+        fetchPortfolio(null),
+        selectedSyndicatorId ? fetchPortfolio(selectedSyndicatorId) : Promise.resolve(null),
+      ]);
+      setPortfolioData(portfolioResult);
+      setSyndicatorData(syndicatorResult || portfolioResult);
       setSource('live');
       setError(null);
     } catch (err) {
@@ -83,7 +96,8 @@ export function usePortfolio() {
   }, []);
 
   return {
-    data,
+    portfolioData,     // For Portfolio Overview (all syndicators, no subledger)
+    syndicatorData,    // For Syndicator View (specific syndicator + subledger)
     loading,
     error,
     source,
