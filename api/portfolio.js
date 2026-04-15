@@ -249,7 +249,7 @@ export default async function handler(req, res) {
     });
   }
 
-  function computeSummary(perfs, vintages, ld, synInfo) {
+  function computeSummary(perfs, vintages, ld, synInfo, aggregate) {
     const sum = (arr, fn) => arr.reduce((s, d) => s + fn(d), 0);
     const totalInvested = synInfo?.totalInvested || sum(perfs, d => d.invested);
     const totalCollected = sum(perfs, d => d.collected);
@@ -264,12 +264,16 @@ export default async function handler(req, res) {
     const defaulted = perfs.filter(d => d.status === 'Default').length;
     const dates = perfs.map(d => d.fundedDate).filter(Boolean).sort();
     const l = ld || {};
+    const agg = aggregate || {};
 
-    // Management fees = upfront bank fees from deals (deducted from funded amount)
     const managementFees = Math.round(sum(perfs, d => d.feesPaid));
-    // Residual commissions = per-transaction cost-sharing from subledger
     const residualCommissions = Math.round(l.totalCostSharing || 0);
     const allFees = managementFees + residualCommissions;
+
+    // Cash Available = External Deposits + Fee Refunds + Net Collections - Capital Deployed
+    const cashAvailable = l.externalDeposits
+      ? round2((l.externalDeposits || 0) + (l.feeRefunds || 0) + (l.totalAllocations || 0) - (l.totalCostSharing || 0) - (l.totalInvestments || 0))
+      : 0;
 
     return {
       syndicatorName: synInfo?.name || 'All Syndicators',
@@ -277,13 +281,18 @@ export default async function handler(req, res) {
       period: { start: dates[0] ? new Date(dates[0]).toLocaleDateString() : 'N/A', end: new Date().toLocaleDateString() },
       durationDays: dates[0] ? Math.floor((new Date() - new Date(dates[0])) / 86400000) : 0,
 
-      // Capital Activity — from subledger
+      // Capital Activity — syndicator-specific from subledger
       totalDeposits: l.totalDeposits || 0,
       externalCapital: l.externalDeposits || 0,
       reinvestedReturns: l.reinvestedReturns || 0,
       totalWithdrawals: l.totalWithdrawals || 0,
-      netCapitalDeployed: round2((l.totalDeposits || 0) - (l.totalWithdrawals || 0)),
-      currentCashBalance: l.currentCashBalance || synInfo?.runningBalance || 0,
+      netCapitalDeployed: l.externalDeposits ? round2((l.externalDeposits || 0) - (l.totalWithdrawals || 0)) : 0,
+      currentCashBalance: cashAvailable,
+
+      // Aggregate for Portfolio Overview (all syndicators combined)
+      aggTotalInvested: agg.totalInvestedAll || 0,
+      aggRunningBalance: agg.totalRunningBalanceAll || 0,
+      aggSyndicatorCount: agg.syndicatorCount || 0,
 
       // Deal metrics
       totalInvested: Math.round(totalInvested), numDeals: perfs.length,
@@ -308,10 +317,12 @@ export default async function handler(req, res) {
       unreturned: Math.round(unreturned), grossPnL: Math.round(grossPnL),
 
       // Value
-      totalCurrentValue: Math.round((l.currentCashBalance || synInfo?.runningBalance || 0) + unreturned),
-      netProfit: Math.round((l.currentCashBalance || synInfo?.runningBalance || 0) + unreturned - totalInvested),
+      totalCurrentValue: Math.round(cashAvailable + unreturned),
+      netProfit: Math.round(cashAvailable + unreturned - (l.externalDeposits || totalInvested)),
       projectedXIRR: 0,
-      cashOnCashMultiple: totalInvested > 0 ? round2(((l.currentCashBalance || synInfo?.runningBalance || 0) + unreturned + (l.totalWithdrawals || 0)) / totalInvested) : 0,
+      cashOnCashMultiple: (l.externalDeposits || totalInvested) > 0
+        ? round2((cashAvailable + unreturned + (l.totalWithdrawals || 0)) / (l.externalDeposits || totalInvested))
+        : 0,
 
       // Deal counts
       dealsInProfit: profit, dealsActiveBelowBasis: active, dealsDefaulted: defaulted,
@@ -341,28 +352,37 @@ export default async function handler(req, res) {
     const deals = await getAllDeals();
     const dealPerf = deals.map(mapDeal);
 
+    // ALWAYS fetch contacts for aggregate Portfolio Overview data
+    let allSyndicators = [];
+    try {
+      const contactsResp = await apiFetch('/contacts?limit=100');
+      const contacts = Array.isArray(contactsResp.data) ? contactsResp.data
+        : Array.isArray(contactsResp.data?.data) ? contactsResp.data.data : [];
+      allSyndicators = contacts.filter(c => c.type === 'syndicator').map(c => ({
+        id: c.id, name: c.name,
+        totalInvested: c.details?.totalInvested || 0,
+        runningBalance: c.details?.runningBalance || 0,
+        totalDistributed: c.details?.totalDistributed || 0,
+      }));
+    } catch (e) { /* continue */ }
+
+    // Aggregate across ALL syndicators for Portfolio Overview
+    const aggregate = {
+      totalInvestedAll: allSyndicators.reduce((s, c) => s + c.totalInvested, 0),
+      totalRunningBalanceAll: allSyndicators.reduce((s, c) => s + c.runningBalance, 0),
+      totalDistributedAll: allSyndicators.reduce((s, c) => s + c.totalDistributed, 0),
+      syndicatorCount: allSyndicators.length,
+    };
+
+    // Fetch syndicator-specific data if syndicatorId provided
     let syndicatorInfo = null;
     let ledgerData = null;
 
     if (syndicatorId) {
-      try {
-        const contactsResp = await apiFetch('/contacts?limit=100');
-        // Handle both { data: [...] } and { data: { data: [...] } }
-        const contacts = Array.isArray(contactsResp.data) ? contactsResp.data
-          : Array.isArray(contactsResp.data?.data) ? contactsResp.data.data : [];
-        const contact = contacts.find(c => c.id === syndicatorId);
-        if (contact) {
-          syndicatorInfo = {
-            id: contact.id, name: contact.name,
-            totalInvested: contact.details?.totalInvested || 0,
-            runningBalance: contact.details?.runningBalance || 0,
-          };
-        }
-      } catch (e) { /* continue */ }
+      syndicatorInfo = allSyndicators.find(c => c.id === syndicatorId) || null;
 
       try {
         const sub = await apiFetch(`/accounting/reports/subledger/syndicator/${syndicatorId}?limit=10000`);
-        // Response shape: { data: { syndicatorId, entries: [...], currentBalance } }
         const subEntries = sub.data?.entries || sub.data?.data || (Array.isArray(sub.data) ? sub.data : []);
         const subBalance = sub.data?.currentBalance || sub.currentBalance || 0;
         ledgerData = parseSubledger(subEntries, subBalance);
@@ -370,7 +390,7 @@ export default async function handler(req, res) {
     }
 
     const vintagesSynd = computeVintages(dealPerf);
-    const summary = computeSummary(dealPerf, vintagesSynd, ledgerData, syndicatorInfo);
+    const summary = computeSummary(dealPerf, vintagesSynd, ledgerData, syndicatorInfo, aggregate);
 
     const curvesPct = vintagesSynd.map(v => ({
       vintage: v.vintage,
@@ -401,6 +421,7 @@ export default async function handler(req, res) {
       xirrFlows: ledgerData?.xirrFlows || [],
       cashFlowChart: ledgerData?.cashFlowChart || [],
       summary,
+      aggregate,
       _meta: {
         fetchedAt: new Date().toISOString(), dealCount: deals.length,
         syndicatorId: syndicatorId || null, syndicatorName: syndicatorInfo?.name || null,
