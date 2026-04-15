@@ -88,22 +88,8 @@ export default async function handler(req, res) {
   //      refi_incoming (IN), balance_transfer_in (IN), balance_transfer_out (OUT)
   // ============================================================
   function parseSubledger(entries, glBalance) {
-    // Only Syndicator Distributions Payable entries (main account)
+    // Main ledger entries
     const ledger = entries.filter(e => e.account === 'Syndicator Distributions Payable');
-
-    // DEBUG: collect unique description patterns
-    const _descPatterns = {};
-    for (const e of ledger) {
-      const d = (e.description || '').substring(0, 100);
-      // Normalize deal IDs and numbers for grouping
-      const key = d.replace(/[A-Z]-\d{4}-[A-Z]{3}-[A-Z0-9]{3}/g, '{DEAL}')
-                    .replace(/\d{4}-\d{2}-\d{2}/g, '{DATE}')
-                    .replace(/\$[\d,.]+/g, '{$}');
-      if (!_descPatterns[key]) _descPatterns[key] = { count: 0, credit: 0, debit: 0, sample: e.description?.substring(0, 120) };
-      _descPatterns[key].count++;
-      _descPatterns[key].credit += e.credit || 0;
-      _descPatterns[key].debit += e.debit || 0;
-    }
 
     // === CAPITAL ACTIVITY ===
     let externalCapital = 0;      // deposits that are new capital
@@ -162,9 +148,10 @@ export default async function handler(req, res) {
         totalInvestments += credit;
         dailyFlows[date].investments += credit;
 
-      // --- COLLECTIONS (syndicator allocations from merchant payments) ---
+      // --- COLLECTIONS (syndicator allocations) ---
       } else if (desc.includes('syndicator allocation:')) {
-        if (desc.includes('early payoff') || desc.includes('early partial payoff')) {
+        // Classify: "payoff" anywhere = refi proceeds, "balance transfer" = BT, else = merchant
+        if (desc.includes('payoff')) {
           refiProceeds += credit;
         } else if (desc.includes('balance transfer')) {
           balanceTransfersIn += credit;
@@ -173,15 +160,10 @@ export default async function handler(req, res) {
         }
         dailyFlows[date].collections += credit;
 
-      // --- FEES (cost-sharing deductions) ---
+      // --- FEES (cost-sharing deductions from subledger = residual commissions only) ---
+      // Management fees (one-time upfront) are NOT in the subledger — they come from deal bankFees
       } else if (desc.includes('cost-sharing deductions:')) {
-        // Check description for fee type
-        // In the syndicator_report, description field has "MANAGEMENT FEE" or "Residual Commission"
-        if (descOrig.includes('MANAGEMENT FEE') || descOrig.includes('Management Fee')) {
-          managementFees += debit;
-        } else {
-          residualCommissions += debit;
-        }
+        residualCommissions += debit;
         dailyFlows[date].fees += debit;
       }
     }
@@ -269,7 +251,7 @@ export default async function handler(req, res) {
       // Return Metrics
       netCollections, unreturned, totalValue, netProfit, cashOnCash,
       // Flows
-      xirrFlows, cashFlowChart, _descPatterns,
+      xirrFlows, cashFlowChart,
     };
   }
 
@@ -383,24 +365,61 @@ export default async function handler(req, res) {
       })(),
 
       // === FEE ANALYSIS (rows 25-30) ===
-      managementFees: hasSub ? Math.round(l.managementFees) : Math.round(sum(d => d.feesPaid)),
+      // Management fees (One-Time/Upfront) = NOT in subledger API.
+      // Derived from deal-level bank fees (invested - netFunded) scaled by syndicator share.
+      managementFees: (() => {
+        const totalBizFees = sum(d => d.invested - d.netFunded); // business-level bank fees
+        const totalBizInvested = sum(d => d.invested);
+        const syndInvested = synInfo?.totalInvested || totalBizInvested;
+        const syndShare = totalBizInvested > 0 ? syndInvested / totalBizInvested : 1;
+        return Math.round(totalBizFees * syndShare);
+      })(),
+      // Residual Commissions (Per Transaction) = from subledger cost-sharing deductions
       residualCommissions: hasSub ? Math.round(l.residualCommissions) : 0,
-      totalFees: hasSub ? Math.round(l.totalFees) : Math.round(sum(d => d.feesPaid)),
+      // Total Fees = Management + Residual
+      totalFees: (() => {
+        const totalBizFees = sum(d => d.invested - d.netFunded);
+        const totalBizInvested = sum(d => d.invested);
+        const syndInvested = synInfo?.totalInvested || totalBizInvested;
+        const syndShare = totalBizInvested > 0 ? syndInvested / totalBizInvested : 1;
+        const mgmt = totalBizFees * syndShare;
+        const residual = hasSub ? l.residualCommissions : 0;
+        return Math.round(mgmt + residual);
+      })(),
       // Fees as % of Invested = Total Fees / Total Invested (from contacts)
       feesPctInvested: (() => {
         const inv = synInfo?.totalInvested || sum(d => d.invested);
-        const fees = hasSub ? l.totalFees : sum(d => d.feesPaid);
-        return inv > 0 ? round2(fees / inv) : 0;
+        const totalBizFees = sum(d => d.invested - d.netFunded);
+        const totalBizInvested = sum(d => d.invested);
+        const syndShare = totalBizInvested > 0 ? inv / totalBizInvested : 1;
+        const mgmt = totalBizFees * syndShare;
+        const residual = hasSub ? l.residualCommissions : 0;
+        return inv > 0 ? round2((mgmt + residual) / inv) : 0;
       })(),
       // Fees as % of Collections = Total Fees / Gross Collections
       feesPctCollections: (() => {
         const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
-        const fees = hasSub ? l.totalFees : sum(d => d.feesPaid);
-        return coll > 0 ? round2(fees / coll) : 0;
+        const totalBizFees = sum(d => d.invested - d.netFunded);
+        const totalBizInvested = sum(d => d.invested);
+        const inv = synInfo?.totalInvested || totalBizInvested;
+        const syndShare = totalBizInvested > 0 ? inv / totalBizInvested : 1;
+        const mgmt = totalBizFees * syndShare;
+        const residual = hasSub ? l.residualCommissions : 0;
+        return coll > 0 ? round2((mgmt + residual) / coll) : 0;
       })(),
 
       // === RETURN METRICS (rows 32-48) ===
-      netCollections: hasSub ? Math.round(l.netCollections) : Math.round(sum(d => d.collected) - sum(d => d.feesPaid)),
+      // Net Collections = Gross Collections - Total Fees (management + residual)
+      netCollections: (() => {
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        const totalBizFees = sum(d => d.invested - d.netFunded);
+        const totalBizInvested = sum(d => d.invested);
+        const inv = synInfo?.totalInvested || totalBizInvested;
+        const syndShare = totalBizInvested > 0 ? inv / totalBizInvested : 1;
+        const mgmt = totalBizFees * syndShare;
+        const residual = hasSub ? l.residualCommissions : 0;
+        return Math.round(coll - mgmt - residual);
+      })(),
       // Unreturned Principal = Total Invested (contacts) - Gross Collections
       unreturned: (() => {
         const inv = synInfo?.totalInvested || sum(d => d.invested);
@@ -547,16 +566,11 @@ export default async function handler(req, res) {
       cashFlowChart: ledgerData?.cashFlowChart || [],
       summary, aggregate,
       _debug: {
-        descPatterns: ledgerData?._descPatterns || null,
         ledgerTotals: ledgerData ? {
           merchantPayments: ledgerData.merchantPayments,
           refiProceeds: ledgerData.refiProceeds,
-          balanceTransfersIn: ledgerData.balanceTransfersIn,
-          balanceTransfersOut: ledgerData.balanceTransfersOut,
           totalGrossCollections: ledgerData.totalGrossCollections,
-          managementFees: ledgerData.managementFees,
           residualCommissions: ledgerData.residualCommissions,
-          totalFees: ledgerData.totalFees,
           totalInvestments: ledgerData.totalInvestments,
           externalCapital: ledgerData.externalCapital,
           cashBalance: ledgerData.cashBalance,
