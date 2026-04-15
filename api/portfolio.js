@@ -91,6 +91,20 @@ export default async function handler(req, res) {
     // Only Syndicator Distributions Payable entries (main account)
     const ledger = entries.filter(e => e.account === 'Syndicator Distributions Payable');
 
+    // DEBUG: collect unique description patterns
+    const _descPatterns = {};
+    for (const e of ledger) {
+      const d = (e.description || '').substring(0, 100);
+      // Normalize deal IDs and numbers for grouping
+      const key = d.replace(/[A-Z]-\d{4}-[A-Z]{3}-[A-Z0-9]{3}/g, '{DEAL}')
+                    .replace(/\d{4}-\d{2}-\d{2}/g, '{DATE}')
+                    .replace(/\$[\d,.]+/g, '{$}');
+      if (!_descPatterns[key]) _descPatterns[key] = { count: 0, credit: 0, debit: 0, sample: e.description?.substring(0, 120) };
+      _descPatterns[key].count++;
+      _descPatterns[key].credit += e.credit || 0;
+      _descPatterns[key].debit += e.debit || 0;
+    }
+
     // === CAPITAL ACTIVITY ===
     let externalCapital = 0;      // deposits that are new capital
     let reinvestedReturns = 0;    // deposits that are recycled payouts/reinvestments
@@ -255,7 +269,7 @@ export default async function handler(req, res) {
       // Return Metrics
       netCollections, unreturned, totalValue, netProfit, cashOnCash,
       // Flows
-      xirrFlows, cashFlowChart,
+      xirrFlows, cashFlowChart, _descPatterns,
     };
   }
 
@@ -532,6 +546,22 @@ export default async function handler(req, res) {
       xirrFlows: ledgerData?.xirrFlows || [],
       cashFlowChart: ledgerData?.cashFlowChart || [],
       summary, aggregate,
+      _debug: {
+        descPatterns: ledgerData?._descPatterns || null,
+        ledgerTotals: ledgerData ? {
+          merchantPayments: ledgerData.merchantPayments,
+          refiProceeds: ledgerData.refiProceeds,
+          balanceTransfersIn: ledgerData.balanceTransfersIn,
+          balanceTransfersOut: ledgerData.balanceTransfersOut,
+          totalGrossCollections: ledgerData.totalGrossCollections,
+          managementFees: ledgerData.managementFees,
+          residualCommissions: ledgerData.residualCommissions,
+          totalFees: ledgerData.totalFees,
+          totalInvestments: ledgerData.totalInvestments,
+          externalCapital: ledgerData.externalCapital,
+          cashBalance: ledgerData.cashBalance,
+        } : null,
+      },
       _meta: {
         fetchedAt: new Date().toISOString(), dealCount: deals.length,
         syndicatorId: syndicatorId || null, syndicatorName: syndicatorInfo?.name || null,
