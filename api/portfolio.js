@@ -120,7 +120,7 @@ export default async function handler(req, res) {
 
       if (desc.includes('syndicator deposit:')) {
         // Classify deposit type
-        if (desc.includes('reinvest')) {
+        if (desc.includes('reinvest') || desc.includes('payout')) {
           reinvestedReturns += credit;
         } else if (desc.includes('refund')) {
           // Fee refunds — not new capital, track separately
