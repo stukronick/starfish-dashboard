@@ -356,12 +356,38 @@ export default async function handler(req, res) {
       } catch (e) { /* continue */ }
 
       try {
-        const sub = await apiFetch(`/accounting/reports/subledger/syndicator/${syndicatorId}`);
-        // Handle both { data: [...], currentBalance } and { data: { data: [...], currentBalance } }
-        const subEntries = Array.isArray(sub.data) ? sub.data
-          : Array.isArray(sub.data?.data) ? sub.data.data : [];
-        const subBalance = sub.currentBalance ?? sub.data?.currentBalance ?? 0;
+        const sub = await apiFetch(`/accounting/reports/subledger/syndicator/${syndicatorId}?limit=10000`);
+        // Handle various response shapes and get entries + balance
+        let subEntries = [];
+        let subBalance = 0;
+        if (Array.isArray(sub.data)) {
+          subEntries = sub.data;
+          subBalance = sub.currentBalance || 0;
+        } else if (sub.data && Array.isArray(sub.data.data)) {
+          subEntries = sub.data.data;
+          subBalance = sub.data.currentBalance || sub.currentBalance || 0;
+        } else if (sub.data && typeof sub.data === 'object') {
+          // Maybe entries are at a different key
+          const keys = Object.keys(sub.data);
+          for (const k of keys) {
+            if (Array.isArray(sub.data[k]) && sub.data[k].length > 0 && sub.data[k][0].date) {
+              subEntries = sub.data[k];
+              break;
+            }
+          }
+          subBalance = sub.data.currentBalance || sub.currentBalance || 0;
+        }
+        // Store entry count for debugging
         ledgerData = parseSubledger(subEntries, subBalance);
+        ledgerData._debug = {
+          entryCount: subEntries.length,
+          balanceFound: subBalance,
+          responseKeys: Object.keys(sub),
+          dataType: typeof sub.data,
+          dataKeys: sub.data ? Object.keys(sub.data) : [],
+          isDataArray: Array.isArray(sub.data),
+          firstEntry: subEntries.length > 0 ? subEntries[0] : null,
+        };
       } catch (e) { /* continue */ }
     }
 
@@ -401,6 +427,7 @@ export default async function handler(req, res) {
         fetchedAt: new Date().toISOString(), dealCount: deals.length,
         syndicatorId: syndicatorId || null, syndicatorName: syndicatorInfo?.name || null,
         hasSubledger: !!ledgerData, source: 'SmartMCA Nexus API (live)',
+        subledgerDebug: ledgerData?._debug || null,
       },
     });
   } catch (error) {
