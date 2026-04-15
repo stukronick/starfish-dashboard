@@ -281,13 +281,15 @@ export default async function handler(req, res) {
       period: { start: dates[0] ? new Date(dates[0]).toLocaleDateString() : 'N/A', end: new Date().toLocaleDateString() },
       durationDays: dates[0] ? Math.floor((new Date() - new Date(dates[0])) / 86400000) : 0,
 
-      // Capital Activity — syndicator-specific from subledger
-      totalDeposits: l.totalDeposits || 0,
-      externalCapital: l.externalDeposits || 0,
+      // Capital Activity — from subledger if available, otherwise from contacts aggregate
+      totalDeposits: l.totalDeposits || agg.totalInvestedAll || 0,
+      externalCapital: l.externalDeposits || agg.totalInvestedAll || 0,
       reinvestedReturns: l.reinvestedReturns || 0,
-      totalWithdrawals: l.totalWithdrawals || 0,
-      netCapitalDeployed: l.externalDeposits ? round2((l.externalDeposits || 0) - (l.totalWithdrawals || 0)) : 0,
-      currentCashBalance: cashAvailable,
+      totalWithdrawals: l.totalWithdrawals || agg.totalDistributedAll || 0,
+      netCapitalDeployed: l.externalDeposits
+        ? round2((l.externalDeposits || 0) - (l.totalWithdrawals || 0))
+        : round2((agg.totalInvestedAll || 0) - (agg.totalDistributedAll || 0)),
+      currentCashBalance: cashAvailable || round2((agg.totalRunningBalanceAll || 0) - (agg.totalInvestedAll || 0)),
 
       // Aggregate for Portfolio Overview (all syndicators combined)
       aggTotalInvested: agg.totalInvestedAll || 0,
