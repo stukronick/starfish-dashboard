@@ -98,6 +98,7 @@ export default async function handler(req, res) {
 
     let externalDeposits = 0;
     let reinvestedReturns = 0;
+    let feeRefunds = 0;
     let totalWithdrawals = 0;
     let totalInvestments = 0;
     let totalAllocations = 0;
@@ -118,9 +119,12 @@ export default async function handler(req, res) {
       if (!dailyFlows[date]) dailyFlows[date] = { deposits: 0, withdrawals: 0, allocations: 0, fees: 0 };
 
       if (desc.includes('syndicator deposit:')) {
-        // Separate external deposits from reinvestments
+        // Classify deposit type
         if (desc.includes('reinvest')) {
           reinvestedReturns += credit;
+        } else if (desc.includes('refund')) {
+          // Fee refunds — not new capital, track separately
+          feeRefunds += credit;
         } else {
           externalDeposits += credit;
         }
@@ -149,7 +153,7 @@ export default async function handler(req, res) {
       }
     }
 
-    const totalDeposits = externalDeposits + reinvestedReturns;
+    const totalDeposits = externalDeposits + reinvestedReturns + feeRefunds;
 
     // XIRR flows
     const xirrFlows = [];
@@ -191,6 +195,7 @@ export default async function handler(req, res) {
       totalDeposits: round2(totalDeposits),
       externalDeposits: round2(externalDeposits),
       reinvestedReturns: round2(reinvestedReturns),
+      feeRefunds: round2(feeRefunds),
       totalWithdrawals: round2(totalWithdrawals),
       totalInvestments: round2(totalInvestments),
       totalAllocations: round2(totalAllocations),
