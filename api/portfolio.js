@@ -351,31 +351,82 @@ export default async function handler(req, res) {
       currentCashBalance: hasSub ? l.cashBalance : 0,
 
       // === INVESTMENT & COLLECTIONS (rows 13-23) ===
-      totalInvested: hasSub ? Math.round(l.totalInvestments) : Math.round(synInfo?.totalInvested || sum(d => d.invested)),
+      // "Total Invested in MCA Deals" = synInfo.totalInvested from contacts (e.g. $402,430)
+      // NOT subledger investment entries (which track cash flow for balance calc)
+      totalInvested: Math.round(synInfo?.totalInvested || sum(d => d.invested)),
       numDeals: perfs.length,
-      avgDealSize: perfs.length > 0 ? Math.round((hasSub ? l.totalInvestments : (synInfo?.totalInvested || sum(d => d.invested))) / perfs.length) : 0,
+      avgDealSize: perfs.length > 0 ? Math.round((synInfo?.totalInvested || sum(d => d.invested)) / perfs.length) : 0,
       totalMerchantPayments: hasSub ? Math.round(l.merchantPayments) : Math.round(sum(d => d.collected)),
       refiProceeds: hasSub ? Math.round(l.refiProceeds) : 0,
       balanceTransfersIn: hasSub ? Math.round(l.balanceTransfersIn) : 0,
       balanceTransfersOut: hasSub ? Math.round(l.balanceTransfersOut) : 0,
       totalGrossCollections: hasSub ? Math.round(l.totalGrossCollections) : Math.round(sum(d => d.collected)),
-      collectionsPctInvested: hasSub ? l.collectionsPctInvested : (sum(d => d.invested) > 0 ? round2(sum(d => d.collected) / sum(d => d.invested)) : 0),
+      // Collections as % of Invested = Gross Collections / Total Invested (from contacts)
+      collectionsPctInvested: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        return inv > 0 ? round2(coll / inv) : 0;
+      })(),
 
       // === FEE ANALYSIS (rows 25-30) ===
       managementFees: hasSub ? Math.round(l.managementFees) : Math.round(sum(d => d.feesPaid)),
       residualCommissions: hasSub ? Math.round(l.residualCommissions) : 0,
       totalFees: hasSub ? Math.round(l.totalFees) : Math.round(sum(d => d.feesPaid)),
-      feesPctInvested: hasSub ? l.feesPctInvested : 0,
-      feesPctCollections: hasSub ? l.feesPctCollections : 0,
+      // Fees as % of Invested = Total Fees / Total Invested (from contacts)
+      feesPctInvested: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const fees = hasSub ? l.totalFees : sum(d => d.feesPaid);
+        return inv > 0 ? round2(fees / inv) : 0;
+      })(),
+      // Fees as % of Collections = Total Fees / Gross Collections
+      feesPctCollections: (() => {
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        const fees = hasSub ? l.totalFees : sum(d => d.feesPaid);
+        return coll > 0 ? round2(fees / coll) : 0;
+      })(),
 
       // === RETURN METRICS (rows 32-48) ===
       netCollections: hasSub ? Math.round(l.netCollections) : Math.round(sum(d => d.collected) - sum(d => d.feesPaid)),
-      unreturned: hasSub ? Math.round(l.unreturned) : Math.round(Math.max(0, sum(d => d.invested) - sum(d => d.collected))),
+      // Unreturned Principal = Total Invested (contacts) - Gross Collections
+      unreturned: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        return Math.round(Math.max(0, inv - coll));
+      })(),
       grossPnL: Math.round(sum(d => d.netReturn)),
-      totalCurrentValue: hasSub ? Math.round(l.totalValue) : 0,
-      netProfit: hasSub ? Math.round(l.netProfit) : 0,
+      // Total Value = Withdrawals + Cash Balance + Unreturned (row 42)
+      // Recompute here using contacts-based unreturned, not subledger-based
+      totalCurrentValue: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        const unret = Math.max(0, inv - coll);
+        const withdrawals = hasSub ? l.totalWithdrawals : 0;
+        const cash = hasSub ? l.cashBalance : 0;
+        return Math.round(withdrawals + cash + unret);
+      })(),
+      // Net Profit = Total Value - External Capital (row 45)
+      netProfit: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        const unret = Math.max(0, inv - coll);
+        const withdrawals = hasSub ? l.totalWithdrawals : 0;
+        const cash = hasSub ? l.cashBalance : 0;
+        const totalVal = withdrawals + cash + unret;
+        const extCap = hasSub ? l.externalCapital : (agg.totalInvestedAll || 0);
+        return Math.round(totalVal - extCap);
+      })(),
       projectedXIRR: 0,
-      cashOnCashMultiple: hasSub ? l.cashOnCash : 0,
+      // Cash-on-Cash = Total Value / External Capital (row 48)
+      cashOnCashMultiple: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        const unret = Math.max(0, inv - coll);
+        const withdrawals = hasSub ? l.totalWithdrawals : 0;
+        const cash = hasSub ? l.cashBalance : 0;
+        const totalVal = withdrawals + cash + unret;
+        const extCap = hasSub ? l.externalCapital : (agg.totalInvestedAll || 0);
+        return extCap > 0 ? round2(totalVal / extCap) : 0;
+      })(),
 
       // === DEAL STATISTICS (rows 51-57) ===
       dealsInProfit: profit, dealsActiveBelowBasis: active, dealsDefaulted: defaulted,
@@ -386,8 +437,18 @@ export default async function handler(req, res) {
       realizedValue: hasSub ? Math.round(l.totalWithdrawals + l.cashBalance) : 0,
       realizedPnL: hasSub ? Math.round(l.totalWithdrawals + l.cashBalance - l.externalCapital) : 0,
       realizedROI: hasSub && l.externalCapital > 0 ? round2((l.totalWithdrawals + l.cashBalance - l.externalCapital) / l.externalCapital) : 0,
-      unrealizedValue: hasSub ? Math.round(l.unreturned) : Math.round(Math.max(0, sum(d => d.invested) - sum(d => d.collected))),
-      pctStillOutstanding: 0, xirrFullRecovery: 0, xirrTotalLoss: 0,
+      unrealizedValue: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        return Math.round(Math.max(0, inv - coll));
+      })(),
+      pctStillOutstanding: (() => {
+        const inv = synInfo?.totalInvested || sum(d => d.invested);
+        const coll = hasSub ? l.totalGrossCollections : sum(d => d.collected);
+        const unret = Math.max(0, inv - coll);
+        return inv > 0 ? round2(unret / inv) : 0;
+      })(),
+      xirrFullRecovery: 0, xirrTotalLoss: 0,
 
       // === COLLECTION ANALYSIS (business-level, from deals) ===
       totalNetFunded: Math.round(sum(d => d.netFunded)),
