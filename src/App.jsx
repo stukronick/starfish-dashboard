@@ -93,6 +93,31 @@ function OverviewPage({ DATA }) {
         <KpiCard label="Projected XIRR" value={fmt(s.projectedXIRR, "xirr")} accent="#FD8E3A" sub={`If total loss: ${fmt(s.xirrTotalLoss, "xirr")}`} />
       </div>
 
+      {/* Portfolio Summary */}
+      <div style={{ background: "#ffffff", borderRadius: 12, padding: 24, border: "1px solid #DFF0FF", boxShadow: "0 1px 4px rgba(8,67,114,0.06)", marginBottom: 32 }}>
+        <Section title="Portfolio Summary">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0 }}>
+            {[
+              ["Total Deals", s.numDeals, false],
+              ["Total Net Funded", s.totalNetFunded, true],
+              ["Total RTR (Purchased)", s.totalRTR, true],
+              ["Total Collected", s.totalCollectedBiz, true],
+              ["Collection % of Net Funded", s.collectionPctNF, "pct"],
+              ["Avg Payback Factor", s.avgPaybackFactor, "factor"],
+              ["Total Exposure (Net Funded - Collections)", s.totalExposure, true],
+              ["Total Remaining RTR Balance", s.totalRemainingRTR, true],
+            ].map(([label, value, isCurrency]) => (
+              <div key={label} style={{ display: "flex", justifyContent: "space-between", padding: "8px 14px", borderBottom: "1px solid #EFF8FF", fontSize: 14 }}>
+                <span style={{ color: "#5a7a9a" }}>{label}</span>
+                <span style={{ fontWeight: 600, color: "#052B4C", fontFamily: "'Inria Sans', sans-serif" }}>
+                  {isCurrency === "pct" ? fmt(value, "pct") : isCurrency === "factor" ? `${value}x` : isCurrency ? fmt(value) : value}
+                </span>
+              </div>
+            ))}
+          </div>
+        </Section>
+      </div>
+
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24, marginBottom: 32 }}>
         {/* Capital Activity */}
         <div style={{ background: "#ffffff", borderRadius: 12, padding: 24, border: "1px solid #DFF0FF", boxShadow: "0 1px 4px rgba(8,67,114,0.06)" }}>
@@ -423,15 +448,15 @@ function SyndicatorPage({ DATA }) {
         <thead>
           <tr><td colSpan={14} style={hdr}>SYNDICATOR PERFORMANCE BY MONTHLY VINTAGE (NET OF FEES)</td></tr>
           <tr>
-            {["Vintage", "# Deals", "Syndicator Invested", "Total Collected", "Total Fees", "Net Collections", "Collection % NI", "Remaining RTR", "Defaulted RTR", "Dflt % RTR", "Exposure", "Default Rate", "Months Active", "Avg Monthly Yield"].map(h => (
-              <td key={h} style={{ ...subHdr, textAlign: "right", fontSize: 10, padding: "6px 8px", whiteSpace: "nowrap" }}>{h}</td>
+            {["Vintage", "# Deals", "Syndicator Invested", "Total Collected", "Total Fees", "Net Collections", "Collection % NI", "Remaining RTR", "Defaulted RTR", "Dflt % RTR", "Exposure", "Default Rate", "Months Active", "Avg Monthly Yield"].map((h, i) => (
+              <td key={h} style={{ ...subHdr, textAlign: i === 0 ? "left" : "right", fontSize: 10, padding: "6px 8px", whiteSpace: "nowrap" }}>{h}</td>
             ))}
           </tr>
         </thead>
         <tbody>
           {DATA.vintagesSynd.map(v => (
             <tr key={v.vintage}>
-              <td style={{ ...valB, padding: "5px 8px" }}>{v.vintage}</td>
+              <td style={{ ...valB, padding: "5px 8px", textAlign: "left", whiteSpace: "nowrap", minWidth: 70 }}>{v.vintage}</td>
               <td style={{ ...val, padding: "5px 8px" }}>{v.numDeals}</td>
               <td style={{ ...val, padding: "5px 8px" }}>{fmt(v.invested)}</td>
               <td style={{ ...val, padding: "5px 8px" }}>{fmt(v.totalCollected)}</td>
@@ -464,15 +489,15 @@ function SyndicatorPage({ DATA }) {
         <thead>
           <tr><td colSpan={7} style={hdr}>SYNDICATOR COLLECTION CURVES — CUMULATIVE % OF INVESTED (NET OF FEES)</td></tr>
           <tr>
-            {["Vintage", "Month 0", "Month 1", "Month 2", "Month 3", "Month 4", "Month 5"].map(h => (
-              <td key={h} style={{ ...subHdr, textAlign: "right", fontSize: 11, padding: "6px 10px" }}>{h}</td>
+            {["Vintage", "Month 0", "Month 1", "Month 2", "Month 3", "Month 4", "Month 5"].map((h, i) => (
+              <td key={h} style={{ ...subHdr, textAlign: i === 0 ? "left" : "right", fontSize: 11, padding: "6px 10px" }}>{h}</td>
             ))}
           </tr>
         </thead>
         <tbody>
           {DATA.curvesPct.map(c => (
             <tr key={c.vintage}>
-              <td style={{ ...valB, padding: "5px 10px" }}>{c.vintage}</td>
+              <td style={{ ...valB, padding: "5px 10px", textAlign: "left", whiteSpace: "nowrap", minWidth: 70 }}>{c.vintage}</td>
               {[0,1,2,3,4,5].map(m => {
                 const v = c[`month${m}`];
                 return <td key={m} style={{ ...val, padding: "5px 10px", color: v == null ? "#B7E2FF" : v >= 1 ? "#166534" : v < 0 ? "#CC0000" : "#052B4C", fontWeight: v != null && v >= 1 ? 700 : 500 }}>{v != null ? fmt(v, "pct") : "N/A"}</td>;
@@ -487,15 +512,16 @@ function SyndicatorPage({ DATA }) {
         <thead>
           <tr><td colSpan={7} style={hdr}>SYNDICATOR COLLECTION CURVES — CUMULATIVE $ (NET OF FEES)</td></tr>
           <tr>
-            {["Vintage", "Month 0", "Month 1", "Month 2", "Month 3", "Month 4", "Month 5"].map(h => (
-              <td key={h} style={{ ...subHdr, textAlign: "right", fontSize: 11, padding: "6px 10px" }}>{h}</td>
+          <tr>
+            {["Vintage", "Month 0", "Month 1", "Month 2", "Month 3", "Month 4", "Month 5"].map((h, i) => (
+              <td key={h} style={{ ...subHdr, textAlign: i === 0 ? "left" : "right", fontSize: 11, padding: "6px 10px" }}>{h}</td>
             ))}
           </tr>
         </thead>
         <tbody>
           {DATA.curvesDollar.map(c => (
             <tr key={c.vintage}>
-              <td style={{ ...valB, padding: "5px 10px" }}>{c.vintage}</td>
+              <td style={{ ...valB, padding: "5px 10px", textAlign: "left", whiteSpace: "nowrap", minWidth: 70 }}>{c.vintage}</td>
               {[0,1,2,3,4,5].map(m => {
                 const v = c[`month${m}`];
                 return <td key={m} style={{ ...val, padding: "5px 10px", color: v == null ? "#B7E2FF" : v < 0 ? "#CC0000" : "#052B4C" }}>{v != null ? fmt(v) : "N/A"}</td>;
