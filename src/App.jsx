@@ -512,7 +512,6 @@ function SyndicatorPage({ DATA }) {
         <thead>
           <tr><td colSpan={7} style={hdr}>SYNDICATOR COLLECTION CURVES — CUMULATIVE $ (NET OF FEES)</td></tr>
           <tr>
-          <tr>
             {["Vintage", "Month 0", "Month 1", "Month 2", "Month 3", "Month 4", "Month 5"].map((h, i) => (
               <td key={h} style={{ ...subHdr, textAlign: i === 0 ? "left" : "right", fontSize: 11, padding: "6px 10px" }}>{h}</td>
             ))}
