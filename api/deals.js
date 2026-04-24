@@ -3,7 +3,7 @@
 
 export default async function handler(req, res) {
   const API_KEY = process.env.SMARTMCA_API_KEY;
-  const API_BASE = process.env.SMARTMCA_API_BASE || 'https://api.nexus.smartmca.com/api/public/v1';
+  const API_BASE = process.env.SMARTMCA_API_BASE || 'https://api.staging.v3.smartmca.com/api/public/v1';
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
