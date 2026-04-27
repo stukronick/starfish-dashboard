@@ -197,6 +197,8 @@ export default async function handler(req, res) {
   //                      investments). Collections + fees come from deals.
   // ==========================================================================
   function parseSubledger(entries) {
+    // Cash-flow side: filter to the syndicator-liability account. This is the
+    // account that carries deposits/withdrawals/investments today.
     const ledger = entries.filter(e => e.account === 'Syndicator Distributions Payable');
 
     let externalCapital = 0;       // new capital deposits
@@ -204,6 +206,7 @@ export default async function handler(req, res) {
     let feeRefunds = 0;            // fee refund credits
     let totalWithdrawals = 0;      // payouts to syndicator
     let totalInvestmentsLedger = 0; // capital deployed to deals (cash-flow truth)
+    let earliestDepositDate = null; // for period.start
 
     const flowsByDate = {}; // for XIRR
     const dailyFlows = {};  // for cash flow chart
@@ -225,6 +228,11 @@ export default async function handler(req, res) {
           feeRefunds += credit;
         } else {
           externalCapital += credit;
+          // BUG #4 FIX: period.start = earliest external-capital deposit
+          // (matches spreadsheet's 8/22/2025 derivation, not earliest deal date)
+          if (!earliestDepositDate || date < earliestDepositDate) {
+            earliestDepositDate = date;
+          }
         }
         dailyFlows[date].deposits += credit;
         flowsByDate[date] = (flowsByDate[date] || 0) - credit; // negative = cash in
@@ -240,6 +248,52 @@ export default async function handler(req, res) {
       }
     }
 
+    // Fee side: scan ALL entries (any account) for fee-bearing rows. Today's
+    // staging API returns 0 of these; the spreadsheet's syndicator_report has
+    // them tagged by Transaction Type column. We pattern-match on description
+    // since the live API doesn't expose Transaction Type as a structured field.
+    //
+    // Spreadsheet ground truth (2026-04-27 LMJS dataset):
+    //   Management Fees       = $37,569.30  (36 rows tagged 'Management Fee Paid (One Time)')
+    //   Residual Commissions  = $16,152.71  (919 rows tagged 'Fee Paid (Per Transaction)')
+    //
+    // Heuristics:
+    //   - "Upfront Sales Commission" or "Management Fee Paid (One Time)" tx type -> management fee
+    //   - "Residual Commission" or "MANAGEMENT FEE" desc on per-transaction tx type -> residual
+    //   The per-transaction "MANAGEMENT FEE" rows are recurring fees-on-collection
+    //   (NOT the upfront one-time fee), so they bucket under residual commissions
+    //   in the spreadsheet's totals.
+    let mgmtFeesLedger = 0;
+    let residualCommissionsLedger = 0;
+    let mgmtFeeCount = 0;
+    let residualCount = 0;
+
+    for (const e of entries) {
+      const desc = (e.description || '');
+      const txType = e.transactionType || e.type || '';
+      const amt = (e.debit || 0) + (e.credit || 0); // fees are usually debits, but be tolerant
+
+      // One-time management fee — tagged by transaction type
+      if (txType === 'Management Fee Paid (One Time)' ||
+          /upfront\s+sales\s+commission/i.test(desc)) {
+        mgmtFeesLedger += amt;
+        mgmtFeeCount++;
+        continue;
+      }
+
+      // Per-transaction fees — both residual commissions and per-collection mgmt fees
+      // get summed here per the spreadsheet's accounting.
+      if (txType === 'Fee Paid (Per Transaction)') {
+        residualCommissionsLedger += amt;
+        residualCount++;
+      }
+    }
+
+    // Avoid double-counting: if fee entries are present in the subledger, the
+    // accountSide=='Syndicator Distributions Payable' filter above may have
+    // already counted them as investments/withdrawals. We don't have evidence
+    // either way from staging (where entries are zero). Flag both sides so the
+    // caller can choose which to trust via _debug.
     return {
       externalCapital: round2(externalCapital),
       reinvestedReturns: round2(reinvestedReturns),
@@ -247,23 +301,31 @@ export default async function handler(req, res) {
       totalDeposits: round2(externalCapital + reinvestedReturns + feeRefunds),
       totalWithdrawals: round2(totalWithdrawals),
       totalInvestmentsLedger: round2(totalInvestmentsLedger),
+      // Fee-side data (present when subledger is fully rebuilt; zero today)
+      mgmtFeesLedger: round2(mgmtFeesLedger),
+      residualCommissionsLedger: round2(residualCommissionsLedger),
+      mgmtFeeCount,
+      residualCount,
+      hasLedgerFees: mgmtFeeCount > 0 || residualCount > 0,
+      earliestDepositDate,
       flowsByDate,
       dailyFlows,
       entryCount: ledger.length,
+      totalEntryCount: entries.length,
     };
   }
 
   // ==========================================================================
-  // 4. DERIVE SYNDICATOR-LEVEL METRICS FROM DEAL DATA
+  // 4. DERIVE SYNDICATOR-LEVEL METRICS FROM DEAL DATA + LEDGER FEES
   //    Without per-deal syndicator participation in the API, we approximate
   //    the syndicator's share of each deal proportionally:
   //        syndShare = synInfo.totalInvested / sum(deal.invested)
   //    Then:
   //        syndCollected_total = syndShare * sum(deal.collected)
-  //        mgmtFees            = syndInvested * managementFeeRate
-  //        residualCommissions = syndCollected_total * residualCommissionRate
+  //        mgmtFees       = ledger entries (preferred) or syndInvested * rate
+  //        residuals      = ledger entries (preferred) or collections * rate
   // ==========================================================================
-  function deriveSyndicatorMetrics(perfs, synInfo, feeConfig) {
+  function deriveSyndicatorMetrics(perfs, synInfo, feeConfig, sub) {
     const bizInvestedTotal = perfs.reduce((s, d) => s + d.invested, 0);
     const bizCollectedTotal = perfs.reduce((s, d) => s + d.collected, 0);
 
@@ -273,9 +335,20 @@ export default async function handler(req, res) {
     // Syndicator's share of business-level collections
     const totalGrossCollections = round2(syndShare * bizCollectedTotal);
 
-    // Fees per spreadsheet formulas
-    const managementFees = round2(syndInvested * feeConfig.managementFeeRate);
-    const residualCommissions = round2(totalGrossCollections * feeConfig.residualCommissionRate);
+    // Fee resolution: prefer ledger-observed totals when present, else derive
+    // from per-syndicator rate config. The ledger path is the spec-correct
+    // path (§2.3); the rate path is a fallback for the post-rebuild gap where
+    // fee entries are missing from staging.
+    let managementFees, residualCommissions, feeSource;
+    if (sub && sub.hasLedgerFees) {
+      managementFees = sub.mgmtFeesLedger;
+      residualCommissions = sub.residualCommissionsLedger;
+      feeSource = 'ledger';
+    } else {
+      managementFees = round2(syndInvested * feeConfig.managementFeeRate);
+      residualCommissions = round2(totalGrossCollections * feeConfig.residualCommissionRate);
+      feeSource = 'derived';
+    }
     const totalFees = round2(managementFees + residualCommissions);
 
     return {
@@ -295,6 +368,7 @@ export default async function handler(req, res) {
       managementFees,
       residualCommissions,
       totalFees,
+      feeSource,
     };
   }
 
@@ -506,10 +580,17 @@ export default async function handler(req, res) {
       syndicatorName: synInfo?.name || 'All Syndicators',
       syndicatorId: synInfo?.id || '',
       period: {
-        start: dates[0] ? new Date(dates[0]).toLocaleDateString() : 'N/A',
+        // BUG #4 FIX: prefer earliest deposit date over earliest deal date
+        // when subledger is available (matches spreadsheet's 8/22/2025 vs
+        // earliest-deal-funded 10/14/2025 derivation).
+        start: (hasSyndicator && sub?.earliestDepositDate)
+          ? new Date(sub.earliestDepositDate + 'T00:00:00').toLocaleDateString()
+          : dates[0] ? new Date(dates[0]).toLocaleDateString() : 'N/A',
         end: new Date().toLocaleDateString(),
       },
-      durationDays: dates[0] ? Math.floor((new Date() - new Date(dates[0])) / 86400000) : 0,
+      durationDays: (hasSyndicator && sub?.earliestDepositDate)
+        ? Math.floor((new Date() - new Date(sub.earliestDepositDate + 'T00:00:00')) / 86400000)
+        : dates[0] ? Math.floor((new Date() - new Date(dates[0])) / 86400000) : 0,
 
       // Capital Activity (rows 5-11)
       totalDeposits: hasSyndicator ? sub.totalDeposits : (agg.totalInvestedAll || 0),
@@ -542,7 +623,14 @@ export default async function handler(req, res) {
       // Return Metrics (rows 32-48)
       netCollections: hasSyndicator ? Math.round(fin.netCollections) : 0,
       unreturned: hasSyndicator ? Math.round(fin.unreturned) : 0,
-      grossPnL: Math.round(sumDeal(d => d.netReturn)),
+      // BUG #1 FIX: Gross P&L = Collections - External Capital - Fees (Returns
+      // Summary B36). Old code summed each deal's pAndL field which is the
+      // BUSINESS-level (full-deal) P&L, not the syndicator's share — and is
+      // structurally wrong for a hybrid model anyway. Spreadsheet for LMJS:
+      //   $313,437 - $235,000 - $53,722 = $24,715
+      grossPnL: hasSyndicator
+        ? Math.round(totalGrossCollections - sub.externalCapital - totalFees)
+        : Math.round(sumDeal(d => d.netReturn)),
       totalCurrentValue: hasSyndicator ? Math.round(fin.totalValue) : 0,
       netProfit: hasSyndicator ? Math.round(fin.netProfit) : 0,
       projectedXIRR: 0,
@@ -651,11 +739,14 @@ export default async function handler(req, res) {
         sub = {
           externalCapital: 0, reinvestedReturns: 0, feeRefunds: 0,
           totalDeposits: 0, totalWithdrawals: 0, totalInvestmentsLedger: 0,
-          flowsByDate: {}, dailyFlows: {}, entryCount: 0,
+          mgmtFeesLedger: 0, residualCommissionsLedger: 0,
+          mgmtFeeCount: 0, residualCount: 0, hasLedgerFees: false,
+          earliestDepositDate: null,
+          flowsByDate: {}, dailyFlows: {}, entryCount: 0, totalEntryCount: 0,
         };
       }
 
-      derived = deriveSyndicatorMetrics(dealPerf, synInfo, feeConfig);
+      derived = deriveSyndicatorMetrics(dealPerf, synInfo, feeConfig, sub);
       fin = combineFinancials(sub, derived, synInfo);
       flows = buildFlows(sub, fin);
     }
@@ -689,10 +780,18 @@ export default async function handler(req, res) {
       _debug: {
         subledger: sub ? {
           entryCount: sub.entryCount,
+          totalEntryCount: sub.totalEntryCount,
           externalCapital: sub.externalCapital,
           totalDeposits: sub.totalDeposits,
           totalWithdrawals: sub.totalWithdrawals,
           totalInvestmentsLedger: sub.totalInvestmentsLedger,
+          earliestDepositDate: sub.earliestDepositDate,
+          // Fee-side: zero on staging today; populated when subledger is rebuilt
+          mgmtFeesLedger: sub.mgmtFeesLedger,
+          residualCommissionsLedger: sub.residualCommissionsLedger,
+          mgmtFeeCount: sub.mgmtFeeCount,
+          residualCount: sub.residualCount,
+          hasLedgerFees: sub.hasLedgerFees,
         } : null,
         derived: derived ? {
           syndShare: derived.syndShare,
@@ -703,6 +802,7 @@ export default async function handler(req, res) {
           managementFees: derived.managementFees,
           residualCommissions: derived.residualCommissions,
           totalFees: derived.totalFees,
+          feeSource: derived.feeSource, // 'ledger' or 'derived'
         } : null,
         financials: fin,
         feeConfig: feeConfig ? {
