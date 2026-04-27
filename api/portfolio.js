@@ -17,8 +17,14 @@
 //     Total Value          = Withdrawals + Cash Balance + Unreturned
 //     Net Profit           = Total Value - External Capital
 //     Cash-on-Cash         = Total Value / External Capital
-//     Mgmt Fees            = funded amount * managementFeeRate (12% for LMJS)
-//     Residual Commissions = each collection * residualCommissionRate (5% for LMJS)
+//
+// Fee categorization (two line items, by transaction type):
+//     Management Fees (One-Time)    = SUM where txType = 'Management Fee Paid (One Time)'
+//                                     fallback when ledger empty: 12% × syndicator's totalInvested
+//     Fee Paid (Per Transaction)    = SUM where txType = 'Fee Paid (Per Transaction)'
+//                                     (includes residual commissions, per-collection mgmt fees,
+//                                      and other per-transaction adjustments — lumped per spec)
+//                                     fallback when ledger empty: 5% × derived collections
 //
 // Sources:
 //     GET /deals?limit=100&page=N
@@ -250,30 +256,35 @@ export default async function handler(req, res) {
 
     // Fee side: scan ALL entries (any account) for fee-bearing rows. Today's
     // staging API returns 0 of these; the spreadsheet's syndicator_report has
-    // them tagged by Transaction Type column. We pattern-match on description
-    // since the live API doesn't expose Transaction Type as a structured field.
+    // them tagged by Transaction Type. We sum each type into its own line:
+    //
+    // Two line items, named after the API's transaction types:
+    //   - "Management Fees (One-Time)"   = SUM(txType = 'Management Fee Paid (One Time)')
+    //   - "Fee Paid (Per Transaction)"   = SUM(txType = 'Fee Paid (Per Transaction)')
     //
     // Spreadsheet ground truth (2026-04-27 LMJS dataset):
-    //   Management Fees       = $37,569.30  (36 rows tagged 'Management Fee Paid (One Time)')
-    //   Residual Commissions  = $16,152.71  (919 rows tagged 'Fee Paid (Per Transaction)')
+    //   Management Fees (One-Time)   = $37,569.30  (36 rows)
+    //   Fee Paid (Per Transaction)   = $16,152.71  (919 rows of mixed descriptions —
+    //                                              residual commissions, per-collection
+    //                                              mgmt fees, misc adjustments — all
+    //                                              summed together by transaction type)
     //
-    // Heuristics:
-    //   - "Upfront Sales Commission" or "Management Fee Paid (One Time)" tx type -> management fee
-    //   - "Residual Commission" or "MANAGEMENT FEE" desc on per-transaction tx type -> residual
-    //   The per-transaction "MANAGEMENT FEE" rows are recurring fees-on-collection
-    //   (NOT the upfront one-time fee), so they bucket under residual commissions
-    //   in the spreadsheet's totals.
+    // The JSON field name 'residualCommissionsLedger' is preserved for backward
+    // compatibility with the frontend contract, but the value it holds is the
+    // total of ALL per-transaction fees, not just residual commissions.
     let mgmtFeesLedger = 0;
-    let residualCommissionsLedger = 0;
+    let residualCommissionsLedger = 0; // misnomer: actually all 'Fee Paid (Per Transaction)' rows
     let mgmtFeeCount = 0;
-    let residualCount = 0;
+    let residualCount = 0; // misnomer: actually all per-transaction fee row count
 
     for (const e of entries) {
       const desc = (e.description || '');
       const txType = e.transactionType || e.type || '';
       const amt = (e.debit || 0) + (e.credit || 0); // fees are usually debits, but be tolerant
 
-      // One-time management fee — tagged by transaction type
+      // One-time management fee — tagged by transaction type. The fallback
+      // pattern 'upfront sales commission' covers the case where the API
+      // returns no transactionType field but uses this description label.
       if (txType === 'Management Fee Paid (One Time)' ||
           /upfront\s+sales\s+commission/i.test(desc)) {
         mgmtFeesLedger += amt;
@@ -281,8 +292,9 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // Per-transaction fees — both residual commissions and per-collection mgmt fees
-      // get summed here per the spreadsheet's accounting.
+      // Per-transaction fees — summed regardless of description (residual
+      // commissions, per-collection mgmt fees, and misc adjustments all land
+      // here, matching the spreadsheet's by-transaction-type summing).
       if (txType === 'Fee Paid (Per Transaction)') {
         residualCommissionsLedger += amt;
         residualCount++;

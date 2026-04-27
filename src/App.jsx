@@ -342,8 +342,8 @@ function SyndicatorPage({ DATA }) {
         <table style={tbl}>
           <tbody>
             <tr><td colSpan={2} style={hdr}>FEE ANALYSIS</td></tr>
-            <tr><td style={lbl}>Management Fees (One-Time/Upfront)</td><td style={val}>{fmt(s.managementFees)}</td></tr>
-            <tr><td style={lbl}>Residual Commissions (Per Transaction)</td><td style={val}>{fmt(s.residualCommissions)}</td></tr>
+            <tr><td style={lbl}>Management Fees (One-Time)</td><td style={val}>{fmt(s.managementFees)}</td></tr>
+            <tr><td style={lbl}>Fee Paid (Per Transaction)</td><td style={val}>{fmt(s.residualCommissions)}</td></tr>
             <tr><td style={lbl}>Total Fees Paid</td><td style={{ ...valB, color: "#CC0000" }}>{fmt(s.totalFees)}</td></tr>
             <tr><td style={lbl}>Fees as % of Invested</td><td style={val}>{fmt(s.feesPctInvested, "pct")}</td></tr>
             <tr><td style={lbl}>Fees as % of Collections</td><td style={val}>{fmt(s.feesPctCollections, "pct")}</td></tr>
