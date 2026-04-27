@@ -26,6 +26,56 @@
 //     GET /accounting/reports/subledger/syndicator/{id}?limit=10000
 
 // ============================================================================
+// IN-MEMORY CACHE (module-scoped, persists across warm invocations)
+//   Vercel serverless functions retain module state between invocations on the
+//   same warm instance. We use a Map keyed by upstream URL path, with a 5-min
+//   TTL. Cold starts and concurrent instances each get their own cache — that
+//   is OK at this scale.
+//
+//   Why cache the upstream responses (not the final JSON)? So response-shape
+//   changes during a refactor don't get served from a stale cache. The
+//   derivation pipeline (parse, derive, combine, summarize) is fast — ~ms.
+//
+//   Bypass: append ?nocache=1 to any request to force a fresh fetch.
+// ============================================================================
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const cache = new Map(); // path -> { value, expiresAt }
+let cacheStats = { hits: 0, misses: 0, bypasses: 0 };
+
+async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
+  const now = Date.now();
+
+  if (!bypass) {
+    const entry = cache.get(path);
+    if (entry && entry.expiresAt > now) {
+      cacheStats.hits++;
+      return { data: entry.value, cached: true, ageSec: Math.floor((now - entry.fetchedAt) / 1000) };
+    }
+  } else {
+    cacheStats.bypasses++;
+  }
+
+  const resp = await fetch(`${apiBase}${path}`, {
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+  });
+  if (!resp.ok) throw new Error(`${resp.status} on ${path}: ${await resp.text()}`);
+  const value = await resp.json();
+
+  cache.set(path, { value, fetchedAt: now, expiresAt: now + CACHE_TTL_MS });
+  cacheStats.misses++;
+
+  // Opportunistic eviction: if cache grows past 50 entries, drop the oldest.
+  // 50 is well above what one syndicator generates (~3 paths) but caps memory
+  // usage if a misconfigured client cycles through syndicator IDs.
+  if (cache.size > 50) {
+    const oldestKey = [...cache.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0][0];
+    cache.delete(oldestKey);
+  }
+
+  return { data: value, cached: false, ageSec: 0 };
+}
+
+// ============================================================================
 // PER-SYNDICATOR FEE CONFIG
 //   Fee rates are not exposed by any current API endpoint. Until they are,
 //   define them here. Add new syndicators as their rates become known.
@@ -53,17 +103,22 @@ export default async function handler(req, res) {
   const API_BASE = process.env.SMARTMCA_API_BASE || 'https://api.staging.v3.smartmca.com/api/public/v1';
 
   res.setHeader('Access-Control-Allow-Origin', '*');
+  // Browser-side cache for 5 minutes (private = don't cache on shared proxies).
+  // This means a single user clicking around won't even hit our function;
+  // the browser will serve from its own cache for repeated identical requests.
+  res.setHeader('Cache-Control', 'private, max-age=300');
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
   if (!API_KEY) return res.status(500).json({ error: 'SMARTMCA_API_KEY not configured.' });
 
-  const { syndicatorId } = req.query;
+  const { syndicatorId, nocache } = req.query;
+  const bypass = nocache === '1' || nocache === 'true';
 
+  // Per-request fetch tracker: which paths were hit, were they cached, ages.
+  const fetchTrace = [];
   async function apiFetch(path) {
-    const resp = await fetch(`${API_BASE}${path}`, {
-      headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
-    });
-    if (!resp.ok) throw new Error(`${resp.status} on ${path}: ${await resp.text()}`);
-    return resp.json();
+    const result = await cachedApiFetch(path, API_KEY, API_BASE, { bypass });
+    fetchTrace.push({ path, cached: result.cached, ageSec: result.ageSec });
+    return result.data;
   }
 
   function num(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
@@ -655,6 +710,16 @@ export default async function handler(req, res) {
           residualCommissionRate: feeConfig.residualCommissionRate,
           source: SYNDICATOR_FEE_CONFIG[syndicatorId] ? 'explicit' : 'default',
         } : null,
+        cache: {
+          ttlSec: CACHE_TTL_MS / 1000,
+          // Per-request: which upstream paths we hit and whether each was cached
+          fetches: fetchTrace,
+          hitsThisRequest: fetchTrace.filter(f => f.cached).length,
+          missesThisRequest: fetchTrace.filter(f => !f.cached).length,
+          // Lifetime stats since this serverless instance warmed up
+          lifetimeStats: { ...cacheStats },
+          bypassed: bypass,
+        },
       },
       _meta: {
         fetchedAt: new Date().toISOString(),
@@ -663,6 +728,9 @@ export default async function handler(req, res) {
         syndicatorName: synInfo?.name || null,
         hasSubledger: !!sub,
         source: 'SmartMCA Nexus API (live, hybrid: subledger + deal-derived)',
+        cacheStatus: fetchTrace.every(f => f.cached) ? 'all-cached'
+          : fetchTrace.some(f => f.cached) ? 'partial-cache'
+          : 'fresh',
         notes: syndicatorId
           ? 'Collections, mgmt fees, and residual commissions are derived from deal-level data and per-syndicator fee rates. Subledger currently lacks Syndicator Allocation and Cost-Sharing entries (staging rebuild, Apr 2026).'
           : null,
