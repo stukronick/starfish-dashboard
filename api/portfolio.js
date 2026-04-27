@@ -1,15 +1,28 @@
 // Vercel Serverless Function: /api/portfolio
 //
-// HYBRID DATA MODEL (post-staging-rebuild, Apr 2026):
-//   The accounting/reports/subledger endpoint currently only emits deposit,
-//   withdrawal, and investment entries (~136 entries vs. the prior ~1,334).
-//   Collections (Syndicator Allocations), residual commissions (Cost-Sharing
-//   Deductions), refi payoffs, and balance transfers are MISSING.
+// DATA ARCHITECTURE (post-discovery, Apr 2026):
+//   The dashboard reads from three SmartMCA endpoints:
 //
-//   Until the upstream subledger is rebuilt, we use:
-//     - Subledger        -> deposits, withdrawals, investments (cash truth)
-//     - Deal-level data  -> collections, mgmt fees, residual commissions
-//                           (scaled by syndicator share + per-syndicator rates)
+//   1. /deals + /deals/{id}        — Each deal's `syndications` array
+//                                    contains LMJS's exact slice (fundedAmount,
+//                                    cashCollected, cashExposure). Sum across
+//                                    deals for total invested / collected.
+//                                    No proportional approximation.
+//
+//   2. /deals/{id}/payments        — Per-deal payment records typed as
+//                                    merchantPayment, refinancePayoff,
+//                                    balanceTransferIn/Out, fee. Scaled by the
+//                                    syndicator's investmentPercentage on
+//                                    each deal to get their share.
+//
+//   3. /accounting/reports/subledger/syndicator/{id}
+//                                    — Cash flows: deposits, withdrawals,
+//                                    investments. The fee entries the
+//                                    spreadsheet shows (Management Fee Paid
+//                                    One Time, Fee Paid Per Transaction)
+//                                    are NOT exposed in any current API
+//                                    endpoint. Derived from per-syndicator
+//                                    rate config until that changes.
 //
 // Spreadsheet formulas this matches (syndicator_report_base.xlsx):
 //     Cash Balance         = Deposits - Investments + Collections - Fees - Withdrawals
@@ -19,17 +32,17 @@
 //     Cash-on-Cash         = Total Value / External Capital
 //
 // Fee categorization (two line items, by transaction type):
-//     Management Fees (One-Time)    = SUM where txType = 'Management Fee Paid (One Time)'
-//                                     fallback when ledger empty: 12% × syndicator's totalInvested
-//     Fee Paid (Per Transaction)    = SUM where txType = 'Fee Paid (Per Transaction)'
-//                                     (includes residual commissions, per-collection mgmt fees,
-//                                      and other per-transaction adjustments — lumped per spec)
-//                                     fallback when ledger empty: 5% × derived collections
+//     Management Fees (One-Time)    = syndInvested × managementFeeRate (config)
+//     Fee Paid (Per Transaction)    = totalGrossCollections × residualCommissionRate (config)
+//   Per-syndicator rates live in SYNDICATOR_FEE_CONFIG below. When the API
+//   eventually exposes ledger-observed fees, the code prefers those.
 //
 // Sources:
-//     GET /deals?limit=100&page=N
-//     GET /contacts?limit=100        (response: { data: { data: [...] } } or { data: [...] })
-//     GET /accounting/reports/subledger/syndicator/{id}?limit=10000
+//     GET /deals?limit=100&page=N           (paginated list of all deals)
+//     GET /deals/{internalId}               (full deal record with syndications array)
+//     GET /deals/{internalId}/payments      (per-deal collection events)
+//     GET /contacts?limit=100               (response: { data: { data: [...] } } or { data: [...] })
+//     GET /accounting/reports/subledger/syndicator/{id}?limit=10000  (cash flows)
 
 // ============================================================================
 // IN-MEMORY CACHE (module-scoped, persists across warm invocations)
@@ -88,11 +101,18 @@ async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
 //   _default is used when a syndicator has no explicit entry.
 // ============================================================================
 const SYNDICATOR_FEE_CONFIG = {
-  // LMJS
+  // LMJS — rates back-computed from spreadsheet totals (2026-04-27 snapshot):
+  //   $37,569.30 mgmt fees / $424,365 funded → 8.8531%
+  //   $16,152.71 residuals / $313,436.70 collections → 5.1534%
+  // These are TEMPORARY values until LMJS confirms their actual contractual
+  // rates with SmartMCA. The 8.85% is unusual (not a round number); likely
+  // either (a) a different denominator than total funded is used in the
+  // spreadsheet, or (b) the rate is applied selectively (excluding some
+  // deal types). Worth resolving before treating these as canonical.
   'cmo8qi0pj00vy01masnzahelz': {
     name: 'LMJS',
-    managementFeeRate: 0.12,      // 12% of funded amount, charged once at deal funding
-    residualCommissionRate: 0.05, // 5% of each collection
+    managementFeeRate: 0.088531,
+    residualCommissionRate: 0.051534,
   },
   _default: {
     managementFeeRate: 0.12,
@@ -138,63 +158,128 @@ export default async function handler(req, res) {
   // ==========================================================================
   // 1. FETCH ALL DEALS (page-based pagination)
   // ==========================================================================
+  // ==========================================================================
+  // 1. FETCH ALL DEALS
+  //    The /deals?limit=100&page=N list endpoint returns a "shell" deal
+  //    record without the syndications array. The full deal record (returned
+  //    by /deals/{id}) DOES include syndications. We need that array to
+  //    compute per-syndicator funded/collected exactly, so we batch-fetch
+  //    detail for every deal.
+  //
+  //    Cost: ~38 API calls instead of 1. With our 5-minute cache the cold-
+  //    start path adds ~10s; warm requests are unaffected. Acceptable at
+  //    current 5-user scale.
+  // ==========================================================================
   async function getAllDeals() {
-    const deals = [];
+    // Step 1: get the shell list (paginated)
+    const shells = [];
     let page = 1;
     while (true) {
       const r = await apiFetch(`/deals?limit=100&page=${page}`);
-      if (r.data) deals.push(...r.data);
+      if (r.data) shells.push(...r.data);
       if (!r.meta?.pagination || page >= r.meta.pagination.totalPages) break;
       page++;
     }
-    return deals;
+
+    // Step 2: hydrate each deal with the full record (which includes syndications)
+    // Use Promise.all for parallelism — these all hit the cache layer so warm
+    // requests skip the upstream entirely. Cold requests run in parallel.
+    const detailed = await Promise.all(shells.map(async (shell) => {
+      try {
+        const full = await apiFetch(`/deals/${shell.id}`);
+        // The detail endpoint returns { data: {...} } shape
+        return full.data || full;
+      } catch (e) {
+        // If detail fetch fails, fall back to the shell. Loses syndications
+        // for this deal but keeps the pipeline running.
+        return shell;
+      }
+    }));
+
+    return detailed;
+  }
+
+  // Find a specific syndicator's slice of a deal. Returns null if the
+  // syndicator doesn't participate in this deal.
+  function extractSyndicationFor(deal, syndicatorId) {
+    if (!deal.syndications || !syndicatorId) return null;
+    return deal.syndications.find(s => s.syndicatorId === syndicatorId) || null;
   }
 
   // ==========================================================================
-  // 2. MAP DEAL  (SmartMCA shape -> dashboard shape, business-level numbers)
+  // 2. MAP DEAL  (SmartMCA shape -> dashboard shape)
+  //    When syndication is provided, output reflects that syndicator's slice
+  //    of the deal (their funded amount, collected amount, exposure). When
+  //    null, output is business-level (full deal numbers).
   // ==========================================================================
-  function mapDeal(d) {
-    const funded = num(d.fundedAmount);
-    const netFunded = num(d.netFunded);
-    const rtr = num(d.purchaseAmount);
-    const collected = num(d.totalCollected);
-    const outstanding = num(d.outstandingBalance);
-    const exposure = num(d.currentExposure);
-    const pnl = num(d.pAndL);
+  function mapDeal(d, syndication) {
+    const bizFunded = num(d.fundedAmount);
+    const bizNetFunded = num(d.netFunded);
+    const bizRtr = num(d.purchaseAmount);
+    const bizCollected = num(d.totalCollected);
+    const bizOutstanding = num(d.outstandingBalance);
+    const bizExposure = num(d.currentExposure);
+    const bizPnl = num(d.pAndL);
     const bankFees = num(d.bankFees) + num(d.otherFees);
     const factor = num(d.paybackFactor);
     const vintage = toVintage(d.fundedDate);
+
+    // Per-syndicator slice (if applicable)
+    const syndFunded = syndication ? num(syndication.fundedAmount) : 0;
+    const syndCollected = syndication ? num(syndication.cashCollected) : 0;
+    const syndExposure = syndication ? num(syndication.cashExposure) : 0;
+    const syndPct = syndication ? num(syndication.investmentPercentage) / 100 : 0;
+    // P&L for the syndicator: their share of biz-level P&L using their pct
+    const syndPnl = syndication ? round2(bizPnl * syndPct) : 0;
+    // Outstanding scaled by the syndicator's percentage
+    const syndOutstanding = syndication ? round2(bizOutstanding * syndPct) : 0;
 
     let status;
     if (d.status === 'defaulted') status = 'Default';
     else if (d.status === 'closed') status = 'Profit';
     else status = 'Active';
 
+    // Choose which numbers to surface based on whether we have a syndication.
+    // Frontend deal-table fields (invested, collected, netReturn) reflect the
+    // syndicator's slice when one is selected.
+    const invested = syndication ? round2(syndFunded) : round2(bizFunded);
+    const collected = syndication ? round2(syndCollected) : round2(bizCollected);
+    const netReturn = syndication ? syndPnl : round2(bizPnl);
+    const dollarRemaining = status === 'Profit' ? 'Paid Off'
+      : syndication ? syndOutstanding : round2(bizOutstanding);
+
     return {
       dealNo: d.dealId || '',
       internalId: d.id || '',
       merchant: d.merchantName || '',
       merchantState: d.merchantState || '',
-      invested: round2(funded),
-      collected: round2(collected),
+      // Per-syndicator OR biz-level (depending on context)
+      invested,
+      collected,
       feesPaid: round2(bankFees),
-      netReturn: round2(pnl),
-      roi: netFunded > 0 ? round2(pnl / netFunded) : 0,
+      netReturn,
+      roi: invested > 0 ? round2(netReturn / invested) : 0,
       status,
       pmtsRemaining: status === 'Profit' ? 'Paid Off' : status === 'Default' ? 0 : '—',
-      dollarRemaining: status === 'Profit' ? 'Paid Off' : round2(outstanding),
+      dollarRemaining,
       frequency: status === 'Profit' ? 'Paid Off' : status === 'Default' ? '-' : 'Daily',
       vintage,
-      netFunded: round2(netFunded),
-      rtr: round2(rtr),
-      totalCollectedBiz: round2(collected),
-      exposureBiz: round2(exposure),
+      // Always-business-level fields (used in cross-deal aggregations)
+      netFunded: round2(bizNetFunded),
+      rtr: round2(bizRtr),
+      totalCollectedBiz: round2(bizCollected),
+      exposureBiz: round2(bizExposure),
       paybackFactor: factor,
       brokerName: d.brokerName || '',
       isoName: d.iso?.isoName || '',
       score: d.scoreData?.score || 0,
       grade: d.scoreData?.grade || '',
       fundedDate: d.fundedDate || '',
+      // Per-syndicator metadata (helpful for debug + future per-deal views)
+      syndPct: syndication ? round2(syndPct) : 0,
+      syndFunded: round2(syndFunded),
+      syndCollected: round2(syndCollected),
+      syndExposure: round2(syndExposure),
     };
   }
 
@@ -328,29 +413,111 @@ export default async function handler(req, res) {
   }
 
   // ==========================================================================
-  // 4. DERIVE SYNDICATOR-LEVEL METRICS FROM DEAL DATA + LEDGER FEES
-  //    Without per-deal syndicator participation in the API, we approximate
-  //    the syndicator's share of each deal proportionally:
-  //        syndShare = synInfo.totalInvested / sum(deal.invested)
-  //    Then:
-  //        syndCollected_total = syndShare * sum(deal.collected)
-  //        mgmtFees       = ledger entries (preferred) or syndInvested * rate
-  //        residuals      = ledger entries (preferred) or collections * rate
+  // 4. AGGREGATE SYNDICATOR METRICS FROM PER-DEAL SYNDICATION DATA
+  //    The API's deal records contain a `syndications` array with each
+  //    syndicator's exact slice (fundedAmount, cashCollected, cashExposure,
+  //    investmentPercentage). We sum these directly — no proportional
+  //    approximation.
+  //
+  //    For collection breakdown (merchantPayment / refinancePayoff /
+  //    balanceTransferIn / balanceTransferOut) we fetch /deals/{id}/payments
+  //    per deal and scale by the syndicator's percentage on that deal.
+  //
+  //    Fees are still derived (12% mgmt, 5% residual by default) because
+  //    the API's syndication.managementFeeAmount and commissionPercentage
+  //    fields are zero/null across all observed deals. Per-syndicator rates
+  //    in SYNDICATOR_FEE_CONFIG will produce an exact spreadsheet match
+  //    when configured correctly.
   // ==========================================================================
-  function deriveSyndicatorMetrics(perfs, synInfo, feeConfig, sub) {
-    const bizInvestedTotal = perfs.reduce((s, d) => s + d.invested, 0);
-    const bizCollectedTotal = perfs.reduce((s, d) => s + d.collected, 0);
+  async function aggregateSyndicatorMetrics(deals, syndicatorId, feeConfig, sub, fetchPayments) {
+    if (!syndicatorId) return null;
 
-    const syndInvested = synInfo?.totalInvested || 0;
-    const syndShare = bizInvestedTotal > 0 ? syndInvested / bizInvestedTotal : 0;
+    let syndInvested = 0;       // sum of LMJS's per-deal fundedAmount
+    let syndCollected = 0;      // sum of LMJS's per-deal cashCollected
+    let syndExposure = 0;       // sum of LMJS's per-deal cashExposure
+    let dealsParticipated = 0;  // count of deals where LMJS participates
+    const perDealShares = [];   // per-deal {dealId, pct} for collection breakdown
 
-    // Syndicator's share of business-level collections
-    const totalGrossCollections = round2(syndShare * bizCollectedTotal);
+    for (const deal of deals) {
+      const synd = extractSyndicationFor(deal, syndicatorId);
+      if (!synd) continue;
 
-    // Fee resolution: prefer ledger-observed totals when present, else derive
-    // from per-syndicator rate config. The ledger path is the spec-correct
-    // path (§2.3); the rate path is a fallback for the post-rebuild gap where
-    // fee entries are missing from staging.
+      dealsParticipated++;
+      syndInvested += num(synd.fundedAmount);
+      syndCollected += num(synd.cashCollected);
+      syndExposure += num(synd.cashExposure);
+      perDealShares.push({
+        dealInternalId: deal.id,
+        dealNo: deal.dealId,
+        sharePct: num(synd.investmentPercentage) / 100,
+      });
+    }
+
+    syndInvested = round2(syndInvested);
+    syndCollected = round2(syndCollected);
+    syndExposure = round2(syndExposure);
+
+    // Collection breakdown by type, aggregated from /deals/{id}/payments.
+    // Each payment is scaled by the syndicator's investmentPercentage on
+    // that deal. Skip if fetchPayments not provided (e.g., test fixtures).
+    let merchantPayments = 0;
+    let refiProceeds = 0;
+    let balanceTransfersIn = 0;
+    let balanceTransfersOut = 0;
+    let paymentRecordCount = 0;
+
+    if (fetchPayments) {
+      // Parallelize per-deal payment fetches — all hit the cache layer.
+      const paymentResults = await Promise.all(perDealShares.map(async ({ dealInternalId, sharePct }) => {
+        try {
+          const r = await fetchPayments(dealInternalId);
+          return { sharePct, payments: r.data || [] };
+        } catch (e) {
+          return { sharePct, payments: [] };
+        }
+      }));
+
+      for (const { sharePct, payments } of paymentResults) {
+        for (const p of payments) {
+          if (p.status !== 'cleared') continue; // ignore pending/failed
+          const amt = num(p.amount) * sharePct;
+          paymentRecordCount++;
+
+          switch (p.type) {
+            case 'merchantPayment':
+              merchantPayments += amt;
+              break;
+            case 'refinancePayoff':
+              // refinancePayoff direction='out' is a payoff disbursement;
+              // direction='in' is incoming refi proceeds. Sum incoming only.
+              if (p.direction === 'in') refiProceeds += amt;
+              break;
+            case 'balanceTransferIn':
+              balanceTransfersIn += amt;
+              break;
+            case 'balanceTransferOut':
+              balanceTransfersOut += amt;
+              break;
+            // 'fee' entries are bank/processor fees (bd_fee, bank_fee,
+            // default_fee, other_fee) — NOT the spreadsheet's mgmt/residual.
+            // Ignored here; deal-level bank fees are surfaced via mapDeal.
+          }
+        }
+      }
+    }
+
+    merchantPayments = round2(merchantPayments);
+    refiProceeds = round2(refiProceeds);
+    balanceTransfersIn = round2(balanceTransfersIn);
+    balanceTransfersOut = round2(balanceTransfersOut);
+
+    // Total Gross Collections — prefer the syndications.cashCollected sum
+    // (system of record) over the sum of payment-type breakdowns. They
+    // should agree but can drift due to pending/uncleared payments or
+    // unallocated balance transfers.
+    const totalGrossCollections = syndCollected;
+
+    // Fees: prefer ledger entries (currently empty), else derive
     let managementFees, residualCommissions, feeSource;
     if (sub && sub.hasLedgerFees) {
       managementFees = sub.mgmtFeesLedger;
@@ -364,19 +531,19 @@ export default async function handler(req, res) {
     const totalFees = round2(managementFees + residualCommissions);
 
     return {
-      syndShare,
-      syndInvested: round2(syndInvested),
-      bizInvestedTotal: round2(bizInvestedTotal),
-      bizCollectedTotal: round2(bizCollectedTotal),
+      // From syndications array (exact, no approximation)
+      dealsParticipated,
+      syndInvested,
+      syndCollected,
+      syndExposure,
+      // From payments endpoint (scaled by investmentPercentage)
+      merchantPayments,
+      refiProceeds,
+      balanceTransfersIn,
+      balanceTransfersOut,
+      paymentRecordCount,
+      // Aggregate
       totalGrossCollections,
-      // The hybrid model can't reliably split collections by source (merchant
-      // vs refi vs balance-transfer) without subledger detail. Attribute all
-      // derived collections to merchantPayments and zero out the others until
-      // the upstream subledger is rebuilt.
-      merchantPayments: totalGrossCollections,
-      refiProceeds: 0,
-      balanceTransfersIn: 0,
-      balanceTransfersOut: 0,
       managementFees,
       residualCommissions,
       totalFees,
@@ -388,11 +555,14 @@ export default async function handler(req, res) {
   // 5. COMBINE FINANCIALS  (apply spreadsheet formulas exactly)
   // ==========================================================================
   function combineFinancials(sub, derived, synInfo) {
-    // Total Invested: prefer the contact's totalInvested (system of record);
-    // fall back to subledger investment-entry total.
-    const totalInvestments = synInfo?.totalInvested != null
-      ? round2(synInfo.totalInvested)
-      : sub.totalInvestmentsLedger;
+    // Total Invested: prefer the syndications-derived sum (exact, summed
+    // from per-deal LMJS shares). Falls back to the contact's totalInvested
+    // (system of record) and finally to the subledger.
+    const totalInvestments = (derived && derived.syndInvested != null)
+      ? round2(derived.syndInvested)
+      : synInfo?.totalInvested != null
+        ? round2(synInfo.totalInvested)
+        : sub.totalInvestmentsLedger;
 
     // Cash Balance = Deposits - Investments + Collections - Fees - Withdrawals
     const cashBalance = round2(
@@ -699,9 +869,8 @@ export default async function handler(req, res) {
   // MAIN
   // ==========================================================================
   try {
-    // 1. Deals
+    // 1. Deals — fetch full records (including syndications array per deal)
     const deals = await getAllDeals();
-    const dealPerf = deals.map(mapDeal);
 
     // 2. Contacts (always fetch for aggregate)
     let allSyndicators = [];
@@ -729,7 +898,7 @@ export default async function handler(req, res) {
     // 3. Per-syndicator data (only when syndicatorId provided)
     let synInfo = null;
     let sub = null;       // subledger-derived: deposits, withdrawals, investments, flows
-    let derived = null;   // deal-derived: collections, mgmt fees, residual commissions
+    let derived = null;   // syndications-derived: per-deal slice + collection breakdown
     let fin = null;       // combined: cashBalance, unreturned, totalValue, netProfit, etc.
     let feeConfig = null;
     let flows = { xirrFlows: [], cashFlowChart: [] };
@@ -758,12 +927,25 @@ export default async function handler(req, res) {
         };
       }
 
-      derived = deriveSyndicatorMetrics(dealPerf, synInfo, feeConfig, sub);
+      // Aggregate per-deal syndication data + per-deal payment breakdown.
+      // The fetchPayments callback wraps apiFetch so the cache layer
+      // dedupes repeat requests across the page-fan-out.
+      const fetchPayments = (dealInternalId) =>
+        apiFetch(`/deals/${dealInternalId}/payments?limit=200`);
+
+      derived = await aggregateSyndicatorMetrics(deals, syndicatorId, feeConfig, sub, fetchPayments);
       fin = combineFinancials(sub, derived, synInfo);
       flows = buildFlows(sub, fin);
     }
 
-    // 4. Compute vintages + curves (deal-level, syndicator-agnostic)
+    // 4. Build the deal-perf table. When a syndicator is selected, each row
+    // shows that syndicator's slice. When not selected, business-level numbers.
+    const dealPerf = deals.map(d => {
+      const synd = syndicatorId ? extractSyndicationFor(d, syndicatorId) : null;
+      return mapDeal(d, synd);
+    });
+
+    // 5. Compute vintages + curves (deal-level, syndicator-agnostic)
     const vintagesSynd = computeVintages(dealPerf);
     const curves = buildCurves(vintagesSynd);
     const summary = buildSummary(dealPerf, sub, derived, fin, synInfo, aggregate);
@@ -806,10 +988,16 @@ export default async function handler(req, res) {
           hasLedgerFees: sub.hasLedgerFees,
         } : null,
         derived: derived ? {
-          syndShare: derived.syndShare,
+          dealsParticipated: derived.dealsParticipated,
           syndInvested: derived.syndInvested,
-          bizInvestedTotal: derived.bizInvestedTotal,
-          bizCollectedTotal: derived.bizCollectedTotal,
+          syndCollected: derived.syndCollected,
+          syndExposure: derived.syndExposure,
+          // Collection breakdown by source type
+          merchantPayments: derived.merchantPayments,
+          refiProceeds: derived.refiProceeds,
+          balanceTransfersIn: derived.balanceTransfersIn,
+          balanceTransfersOut: derived.balanceTransfersOut,
+          paymentRecordCount: derived.paymentRecordCount,
           totalGrossCollections: derived.totalGrossCollections,
           managementFees: derived.managementFees,
           residualCommissions: derived.residualCommissions,
@@ -839,12 +1027,12 @@ export default async function handler(req, res) {
         syndicatorId: syndicatorId || null,
         syndicatorName: synInfo?.name || null,
         hasSubledger: !!sub,
-        source: 'SmartMCA Nexus API (live, hybrid: subledger + deal-derived)',
+        source: 'SmartMCA Nexus API (live: syndications + payments + subledger cash flows)',
         cacheStatus: fetchTrace.every(f => f.cached) ? 'all-cached'
           : fetchTrace.some(f => f.cached) ? 'partial-cache'
           : 'fresh',
         notes: syndicatorId
-          ? 'Collections, mgmt fees, and residual commissions are derived from deal-level data and per-syndicator fee rates. Subledger currently lacks Syndicator Allocation and Cost-Sharing entries (staging rebuild, Apr 2026).'
+          ? 'Investment, collections, and exposure are read from each deal\'s syndications array (exact). Collection breakdown by type comes from /deals/{id}/payments scaled by investmentPercentage. Cash flows (deposits/withdrawals) come from the syndicator subledger. Mgmt fees and residual commissions are derived from per-syndicator rate config (managementFeeAmount and commissionPercentage in the API are zero/null across observed deals).'
           : null,
       },
     });
