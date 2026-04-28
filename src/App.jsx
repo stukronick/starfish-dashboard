@@ -279,16 +279,28 @@ function SyndicatorPage({ DATA }) {
   cashFlowChart.forEach(c => { cum += c.amount; c.cumulative = cum; });
 
   const vintageColors = ["#0077CF", "#f97316", "#eab308", "#166534", "#78CBFF", "#0596F2", "#FFB772"];
+
+  // Curve data: horizon is dynamic, read from API. New shape: each row keyed
+  // by string month numbers ("0", "1", ... "N"). Old shape: month0, month1...
+  // Support both for backward compatibility during deploy.
+  const monthsHorizon = DATA.curvesMonthsHorizon ?? 5;
+  const monthArray = Array.from({ length: monthsHorizon + 1 }, (_, i) => i);
+  const readMonth = (row, m) => {
+    // Try new key shape first ("0", "1"...), fall back to old ("month0"...)
+    return row[String(m)] ?? row[`month${m}`] ?? null;
+  };
+
   const curvesData = useMemo(() => {
-    return [0, 1, 2, 3, 4, 5].map(m => {
+    return monthArray.map(m => {
       const row = { month: "Mo " + m };
       DATA.curvesPct.forEach(c => {
-        const v = c["month" + m];
+        const v = readMonth(c, m);
         if (v != null) row[c.vintage] = v;
       });
       return row;
     });
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [DATA.curvesPct, monthsHorizon]);
 
   return (
     <div style={{ maxWidth: 1000, margin: "0 auto" }}>
@@ -487,10 +499,11 @@ function SyndicatorPage({ DATA }) {
       {/* ===== COLLECTION CURVES ===== */}
       <table style={{ ...tbl, marginBottom: 20 }}>
         <thead>
-          <tr><td colSpan={7} style={hdr}>SYNDICATOR COLLECTION CURVES — CUMULATIVE % OF INVESTED (NET OF FEES)</td></tr>
+          <tr><td colSpan={monthArray.length + 1} style={hdr}>SYNDICATOR COLLECTION CURVES — CUMULATIVE % OF INVESTED (NET OF FEES)</td></tr>
           <tr>
-            {["Vintage", "Month 0", "Month 1", "Month 2", "Month 3", "Month 4", "Month 5"].map((h, i) => (
-              <td key={h} style={{ ...subHdr, textAlign: i === 0 ? "left" : "right", fontSize: 11, padding: "6px 10px" }}>{h}</td>
+            <td style={{ ...subHdr, textAlign: "left", fontSize: 11, padding: "6px 10px" }}>Vintage</td>
+            {monthArray.map(m => (
+              <td key={m} style={{ ...subHdr, textAlign: "right", fontSize: 11, padding: "6px 10px" }}>Month {m}</td>
             ))}
           </tr>
         </thead>
@@ -498,8 +511,8 @@ function SyndicatorPage({ DATA }) {
           {DATA.curvesPct.map(c => (
             <tr key={c.vintage}>
               <td style={{ ...valB, padding: "5px 10px", textAlign: "left", whiteSpace: "nowrap", minWidth: 70 }}>{c.vintage}</td>
-              {[0,1,2,3,4,5].map(m => {
-                const v = c[`month${m}`];
+              {monthArray.map(m => {
+                const v = readMonth(c, m);
                 return <td key={m} style={{ ...val, padding: "5px 10px", color: v == null ? "#B7E2FF" : v >= 1 ? "#166534" : v < 0 ? "#CC0000" : "#052B4C", fontWeight: v != null && v >= 1 ? 700 : 500 }}>{v != null ? fmt(v, "pct") : "N/A"}</td>;
               })}
             </tr>
@@ -510,10 +523,11 @@ function SyndicatorPage({ DATA }) {
       {/* ===== COLLECTION CURVES $ ===== */}
       <table style={tbl}>
         <thead>
-          <tr><td colSpan={7} style={hdr}>SYNDICATOR COLLECTION CURVES — CUMULATIVE $ (NET OF FEES)</td></tr>
+          <tr><td colSpan={monthArray.length + 1} style={hdr}>SYNDICATOR COLLECTION CURVES — CUMULATIVE $ (NET OF FEES)</td></tr>
           <tr>
-            {["Vintage", "Month 0", "Month 1", "Month 2", "Month 3", "Month 4", "Month 5"].map((h, i) => (
-              <td key={h} style={{ ...subHdr, textAlign: i === 0 ? "left" : "right", fontSize: 11, padding: "6px 10px" }}>{h}</td>
+            <td style={{ ...subHdr, textAlign: "left", fontSize: 11, padding: "6px 10px" }}>Vintage</td>
+            {monthArray.map(m => (
+              <td key={m} style={{ ...subHdr, textAlign: "right", fontSize: 11, padding: "6px 10px" }}>Month {m}</td>
             ))}
           </tr>
         </thead>
@@ -521,8 +535,8 @@ function SyndicatorPage({ DATA }) {
           {DATA.curvesDollar.map(c => (
             <tr key={c.vintage}>
               <td style={{ ...valB, padding: "5px 10px", textAlign: "left", whiteSpace: "nowrap", minWidth: 70 }}>{c.vintage}</td>
-              {[0,1,2,3,4,5].map(m => {
-                const v = c[`month${m}`];
+              {monthArray.map(m => {
+                const v = readMonth(c, m);
                 return <td key={m} style={{ ...val, padding: "5px 10px", color: v == null ? "#B7E2FF" : v < 0 ? "#CC0000" : "#052B4C" }}>{v != null ? fmt(v) : "N/A"}</td>;
               })}
             </tr>

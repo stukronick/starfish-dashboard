@@ -615,6 +615,10 @@ export default async function handler(req, res) {
         }
 
         const payments = res.value;
+        // Stash payments on the perDealShares entry so the curve builder
+        // can re-read them later. Each entry now carries its raw payments.
+        perDealShares[i].payments = payments;
+
         for (const p of payments) {
           if (p.status !== 'cleared') continue; // ignore pending/failed
           const amt = num(p.amount) * sharePct;
@@ -685,6 +689,10 @@ export default async function handler(req, res) {
       residualCommissions,
       totalFees,
       feeSource,
+      // Raw per-deal data (used by buildCollectionCurves to bucket payments
+      // by months-since-funding for each vintage). Each entry contains:
+      //   { dealInternalId, dealNo, sharePct, payments: [...] }
+      perDealShares,
     };
   }
 
@@ -843,28 +851,161 @@ export default async function handler(req, res) {
   }
 
   // ==========================================================================
-  // 8. COLLECTION CURVES  (unchanged)
+  // 8. COLLECTION CURVES  (real cohort analysis from payment events)
+  //
+  //    For each vintage cohort (e.g. '2026-02'), compute cumulative net
+  //    collections at month 0, 1, 2, ... N from funding date. "Month X" =
+  //    days [X*30, (X+1)*30) since the deal's fundedDate. This is the
+  //    standard convention for syndication cohort analysis (NOT calendar
+  //    months — a Feb 28 deal and a Feb 1 deal don't reach "1 month old"
+  //    on the same date).
+  //
+  //    Inputs:
+  //      vintages       - output of computeVintages, gives per-vintage invested
+  //                       and net collected totals for the denominator
+  //      deals          - full deal records (we need fundedDate per deal)
+  //      perDealData    - array of { dealInternalId, sharePct, payments }
+  //                       For syndicator scope: sharePct is LMJS's pct.
+  //                       For business scope: sharePct = 1 (full deal).
+  //      today          - reference date (so we know horizon)
+  //
+  //    Output:
+  //      { pct: [...], dollar: [...] }
+  //      Each entry: { vintage, monthsHorizon, "0": ..., "1": ..., ..., "N": ... }
+  //      Month columns beyond a vintage's age are null. Horizon N is dynamic
+  //      based on oldest vintage in the data.
+  //
+  //    Net collections = cleared collection-type payments (merchant, refi,
+  //    balance-transfer in/out) minus per-period fees. Fees are derived as
+  //    constant rate × collection in each period (since per-period fee
+  //    timing isn't in the API). The CUMULATIVE total at month N converges
+  //    to the same final number as the vintage row's netCollections.
   // ==========================================================================
-  function buildCurves(vintages) {
-    const pct = vintages.map(v => ({
+  function buildCollectionCurves(vintages, deals, perDealData, feeConfig, today = new Date()) {
+    if (!vintages || vintages.length === 0) {
+      return { pct: [], dollar: [], monthsHorizon: 0 };
+    }
+
+    // Index deals by internalId for fast lookup of fundedDate
+    const dealById = new Map(deals.map(d => [d.id, d]));
+
+    // Determine global horizon: the oldest vintage's age in 30-day buckets.
+    // Use the start-of-month for the vintage as the cohort funding "anchor"
+    // for horizon-counting purposes; individual deal funding dates within
+    // the vintage are used for actual bucketing.
+    let maxMonths = 0;
+    for (const v of vintages) {
+      const vintageStart = new Date(v.vintage + '-01');
+      const ageMonths = Math.floor((today - vintageStart) / (30 * 86400 * 1000));
+      if (ageMonths > maxMonths) maxMonths = ageMonths;
+    }
+    const monthsHorizon = Math.max(0, Math.min(maxMonths, 24)); // hard cap at 24mo for sanity
+
+    // For each vintage, walk every deal in that vintage's cohort and bucket
+    // payments by months-since-this-deal's-fundedDate.
+    const vintageMap = new Map(vintages.map(v => [v.vintage, {
       vintage: v.vintage,
-      month0: v.monthsActive >= 0 ? round2(v.collectionPctNI * 0.05) : null,
-      month1: v.monthsActive >= 1 ? round2(v.collectionPctNI * 0.35) : null,
-      month2: v.monthsActive >= 2 ? round2(v.collectionPctNI * 0.7) : null,
-      month3: v.monthsActive >= 3 ? round2(v.collectionPctNI * 0.85) : null,
-      month4: v.monthsActive >= 4 ? round2(v.collectionPctNI * 0.95) : null,
-      month5: v.monthsActive >= 5 ? round2(v.collectionPctNI) : null,
-    }));
-    const dollar = pct.map((c, i) => ({
-      vintage: c.vintage,
-      month0: c.month0 != null ? Math.round(c.month0 * vintages[i].invested) : null,
-      month1: c.month1 != null ? Math.round(c.month1 * vintages[i].invested) : null,
-      month2: c.month2 != null ? Math.round(c.month2 * vintages[i].invested) : null,
-      month3: c.month3 != null ? Math.round(c.month3 * vintages[i].invested) : null,
-      month4: c.month4 != null ? Math.round(c.month4 * vintages[i].invested) : null,
-      month5: c.month5 != null ? Math.round(c.month5 * vintages[i].invested) : null,
-    }));
-    return { pct, dollar };
+      invested: v.invested,
+      collectionsByMonth: new Array(monthsHorizon + 1).fill(0),
+      // Track which deals contribute to this vintage so we know each deal's
+      // age (some deals in the cohort may not yet have data for late months)
+      maxDealMonths: 0,
+    }]));
+
+    const COLLECTION_TYPES = new Set(['merchantPayment', 'refinancePayoff', 'balanceTransferIn']);
+    const NEGATIVE_TYPES = new Set(['balanceTransferOut']);
+
+    for (const dealData of perDealData) {
+      const deal = dealById.get(dealData.dealInternalId);
+      if (!deal) continue;
+      const fundedDate = deal.fundedDate ? new Date(deal.fundedDate) : null;
+      if (!fundedDate || isNaN(fundedDate)) continue;
+
+      const vintageKey = `${fundedDate.getFullYear()}-${String(fundedDate.getMonth() + 1).padStart(2, '0')}`;
+      const vint = vintageMap.get(vintageKey);
+      if (!vint) continue;
+
+      // Track the latest month bucket this deal can fill (its current age)
+      const dealAgeMonths = Math.floor((today - fundedDate) / (30 * 86400 * 1000));
+      if (dealAgeMonths > vint.maxDealMonths) vint.maxDealMonths = dealAgeMonths;
+
+      const sharePct = dealData.sharePct;
+      for (const p of dealData.payments || []) {
+        if (p.status !== 'cleared') continue;
+
+        let signedAmt;
+        if (COLLECTION_TYPES.has(p.type)) {
+          // refinancePayoff direction='out' is a payoff disbursement, not a collection
+          if (p.type === 'refinancePayoff' && p.direction !== 'in') continue;
+          signedAmt = num(p.amount) * sharePct;
+        } else if (NEGATIVE_TYPES.has(p.type)) {
+          signedAmt = -num(p.amount) * sharePct;
+        } else {
+          continue;
+        }
+
+        const pDate = new Date(p.transactionDate);
+        if (isNaN(pDate)) continue;
+        const bucket = Math.floor((pDate - fundedDate) / (30 * 86400 * 1000));
+        if (bucket < 0 || bucket > monthsHorizon) continue;
+        vint.collectionsByMonth[bucket] += signedAmt;
+      }
+    }
+
+    // Build the output: cumulative across months, with `null` for buckets
+    // beyond the vintage's max-deal age.
+    const pct = [];
+    const dollar = [];
+    for (const v of vintages) {
+      const vint = vintageMap.get(v.vintage);
+      if (!vint) {
+        // Vintage exists but no payment data for any of its deals — fill with nulls
+        const row = { vintage: v.vintage, monthsHorizon };
+        const dollarRow = { vintage: v.vintage, monthsHorizon };
+        for (let m = 0; m <= monthsHorizon; m++) {
+          row[String(m)] = null;
+          dollarRow[String(m)] = null;
+        }
+        pct.push(row);
+        dollar.push(dollarRow);
+        continue;
+      }
+
+      const feeRate = (feeConfig?.managementFeeRate || 0) + 0; // mgmt fee is one-time on funding
+      // For per-period netting, we apply ONLY the residual rate per collection
+      // (the management fee is a one-time charge, already accounted in totals).
+      const residualRate = feeConfig?.residualCommissionRate || 0;
+
+      const row = { vintage: v.vintage, monthsHorizon };
+      const dollarRow = { vintage: v.vintage, monthsHorizon };
+      let cumulative = 0;
+      // Apply the one-time management fee at month 0 as a deduction
+      const upfrontFee = vint.invested * (feeConfig?.managementFeeRate || 0);
+      cumulative -= upfrontFee;
+
+      for (let m = 0; m <= monthsHorizon; m++) {
+        if (m > vint.maxDealMonths) {
+          row[String(m)] = null;
+          dollarRow[String(m)] = null;
+          continue;
+        }
+        const grossThisMonth = vint.collectionsByMonth[m];
+        const residualThisMonth = grossThisMonth * residualRate;
+        const netThisMonth = grossThisMonth - residualThisMonth;
+        cumulative += netThisMonth;
+
+        if (vint.invested > 0) {
+          row[String(m)] = round2(cumulative / vint.invested);
+        } else {
+          row[String(m)] = null;
+        }
+        dollarRow[String(m)] = Math.round(cumulative);
+      }
+      pct.push(row);
+      dollar.push(dollarRow);
+    }
+
+    return { pct, dollar, monthsHorizon };
   }
 
   // ==========================================================================
@@ -1082,9 +1223,64 @@ export default async function handler(req, res) {
       return mapDeal(d, synd);
     });
 
-    // 5. Compute vintages + curves (deal-level, syndicator-agnostic)
+    // 5. Compute vintages
     const vintagesSynd = computeVintages(dealPerf);
-    const curves = buildCurves(vintagesSynd);
+
+    // 6. Build collection curves (REAL — from payment events).
+    //    Two scopes:
+    //      Syndicator view: use derived.perDealShares (already collected
+    //        per-deal payments scaled by the syndicator's pct).
+    //      Portfolio view: fetch payments for ALL deals (sharePct = 1.0)
+    //        since no syndicator is selected. Adds ~37 API calls on cold
+    //        cache; cached after that.
+    let curves = { pct: [], dollar: [], monthsHorizon: 0 };
+    if (syndicatorId && derived?.perDealShares) {
+      // Syndicator scope: payment data already gathered with sharePct applied
+      curves = buildCollectionCurves(
+        vintagesSynd,
+        deals,
+        derived.perDealShares,
+        feeConfig,
+        new Date()
+      );
+    } else if (!syndicatorId) {
+      // Portfolio scope: fetch payments for every deal at sharePct = 1.0
+      const allDealShares = await pMap(deals, async (deal) => {
+        try {
+          const r = await apiFetch(`/deals/${deal.id}/payments?limit=200`);
+          return {
+            dealInternalId: deal.id,
+            dealNo: deal.dealId,
+            sharePct: 1.0,
+            payments: r.data || [],
+          };
+        } catch (e) {
+          fetchFailures.payments.push({
+            dealId: deal.dealId,
+            internalId: deal.id,
+            error: e.message,
+          });
+          return {
+            dealInternalId: deal.id,
+            dealNo: deal.dealId,
+            sharePct: 1.0,
+            payments: [],
+          };
+        }
+      }, 3);
+      // pMap returns {value, error} — unwrap
+      const flat = allDealShares.map(r => r.value || { dealInternalId: null, sharePct: 1.0, payments: [] });
+      // For portfolio view, fees are not derived per-syndicator. Use _default rates.
+      const portfolioFeeConfig = SYNDICATOR_FEE_CONFIG._default;
+      curves = buildCollectionCurves(
+        vintagesSynd,
+        deals,
+        flat,
+        portfolioFeeConfig,
+        new Date()
+      );
+    }
+
     const summary = buildSummary(dealPerf, sub, derived, fin, synInfo, aggregate);
 
     const vintagesBiz = vintagesSynd.map(v => ({
@@ -1103,6 +1299,7 @@ export default async function handler(req, res) {
       vintagesSynd,
       curvesPct: curves.pct,
       curvesDollar: curves.dollar,
+      curvesMonthsHorizon: curves.monthsHorizon,
       vintagesBiz,
       xirrFlows: flows.xirrFlows,
       cashFlowChart: flows.cashFlowChart,
