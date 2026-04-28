@@ -903,8 +903,124 @@ export default async function handler(req, res) {
 
   // ==========================================================================
   // 6. BUILD XIRR + CASH FLOW CHART  (uses subledger + derived cash balance)
+  //
+  //   XIRR (Extended Internal Rate of Return) is the annualized rate of return
+  //   on a series of cash flows occurring at irregular dates. It's the rate r
+  //   that makes NPV = 0:
+  //     0 = Σ (cf_i / (1 + r)^(daysSinceFirst_i / 365))
+  //
+  //   No closed form — solved iteratively via the secant method (more robust
+  //   than Newton-Raphson for XIRR specifically, since the derivative can be
+  //   tricky near zero).
+  //
+  //   Sign convention: deposits NEGATIVE (cash out), withdrawals POSITIVE
+  //   (cash in). A series with all-positive or all-negative flows has no
+  //   solution — XIRR returns null in those cases.
+  //
+  //   Three scenarios computed:
+  //     - xirrFullRecovery: actual flows + outstanding principal as positive
+  //       flow today (assumes outstanding eventually returns at full value)
+  //     - xirrTotalLoss: actual flows only (assumes outstanding written off)
+  //     - projectedXIRR: same as full recovery (the optimistic midpoint).
+  //       Total loss provides the pessimistic floor.
+  //
+  //   Returns null if iteration doesn't converge or result is unreasonable.
+  //   Frontend should render null as "—" or "N/A".
   // ==========================================================================
-  function buildFlows(sub, fin) {
+  function computeXirr(flows) {
+    if (!flows || flows.length < 2) return null;
+
+    // Normalize: each entry must have {date, amount}; date as YYYY-MM-DD or Date.
+    const points = flows
+      .map(f => ({
+        date: f.date instanceof Date ? f.date : new Date(f.date),
+        amount: typeof f.amount === 'number' ? f.amount : parseFloat(f.amount),
+      }))
+      .filter(p => !isNaN(p.date.getTime()) && !isNaN(p.amount) && p.amount !== 0)
+      .sort((a, b) => a.date - b.date);
+
+    if (points.length < 2) return null;
+
+    // Need both positive and negative flows (otherwise no rate makes NPV = 0)
+    const hasPositive = points.some(p => p.amount > 0);
+    const hasNegative = points.some(p => p.amount < 0);
+    if (!hasPositive || !hasNegative) return null;
+
+    const t0 = points[0].date.getTime();
+    const dayMs = 86400 * 1000;
+
+    // NPV at rate r. Domain: r > -1 (otherwise division by zero or imaginary).
+    function npv(r) {
+      if (r <= -1) return Infinity;
+      let sum = 0;
+      for (const p of points) {
+        const t = (p.date.getTime() - t0) / dayMs / 365;
+        sum += p.amount / Math.pow(1 + r, t);
+      }
+      return sum;
+    }
+
+    // Strategy: scan a wide range of rates to find a sign change in NPV, then
+    // bisect to refine. This is slower than Newton/secant but vastly more
+    // robust for the wild range of XIRRs we see in MCA portfolios (anywhere
+    // from -90% on bad cohorts to +200% on hot ones). With ~100 NPV calls
+    // total it's still microseconds.
+    //
+    // Scan from -95% to +500% in 50 steps; that's wide enough for almost
+    // any realistic XIRR. If we find a sign change between rates a and b,
+    // bisect to TOLERANCE.
+    const TOLERANCE = 1e-6;
+    const MAX_BISECT = 60; // 60 iterations of bisection ≈ 1e-18 precision
+    const SCAN_LO = -0.95;
+    const SCAN_HI = 5.0;
+    const SCAN_STEPS = 50;
+
+    let prevR = SCAN_LO;
+    let prevNpv = npv(prevR);
+    for (let i = 1; i <= SCAN_STEPS; i++) {
+      const r = SCAN_LO + ((SCAN_HI - SCAN_LO) * i) / SCAN_STEPS;
+      const f = npv(r);
+      if (!isFinite(f)) {
+        prevR = r;
+        prevNpv = f;
+        continue;
+      }
+      // Found bracket [prevR, r] where NPV changes sign?
+      if (isFinite(prevNpv) && Math.sign(prevNpv) !== Math.sign(f) && prevNpv !== 0) {
+        // Bisect within [prevR, r]
+        let lo = prevR, hi = r;
+        let fLo = prevNpv, fHi = f;
+        for (let j = 0; j < MAX_BISECT; j++) {
+          const mid = (lo + hi) / 2;
+          const fMid = npv(mid);
+          if (Math.abs(fMid) < TOLERANCE || (hi - lo) < TOLERANCE) {
+            // Converged. Sanity-check the result is in a reasonable range.
+            if (mid < -0.99 || mid > 10) return null;
+            return mid;
+          }
+          if (Math.sign(fMid) === Math.sign(fLo)) {
+            lo = mid;
+            fLo = fMid;
+          } else {
+            hi = mid;
+            fHi = fMid;
+          }
+        }
+        // Bisection didn't quite hit tolerance but we have a tight bracket.
+        const result = (lo + hi) / 2;
+        if (result < -0.99 || result > 10) return null;
+        return result;
+      }
+      prevR = r;
+      prevNpv = f;
+    }
+
+    // No sign change found in the scanned range — XIRR may not exist or
+    // is outside our search domain. Return null rather than guessing.
+    return null;
+  }
+
+  function buildFlows(sub, fin, derived) {
     const xirrFlows = [];
     for (const date of Object.keys(sub.flowsByDate).sort()) {
       const amt = round2(sub.flowsByDate[date]);
@@ -925,6 +1041,37 @@ export default async function handler(req, res) {
       });
     }
 
+    // Compute the three XIRR scenarios.
+    // Total-loss case: just the historical flows (assumes outstanding = 0)
+    const xirrTotalLoss = computeXirr(xirrFlows);
+
+    // Full-recovery case: append outstanding principal as a positive flow today.
+    // For syndicator view, outstanding = fin.unreturned (their slice of unreturned
+    // principal). For portfolio view, fin may not have unreturned, so we fall
+    // back to deal-level outstanding.
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const outstanding = round2(fin.unreturned || 0);
+    let xirrFullRecovery = null;
+    if (outstanding > 0) {
+      const flowsWithRecovery = [
+        ...xirrFlows,
+        {
+          date: todayStr,
+          amount: outstanding,
+          type: 'Projected Recovery',
+          description: 'Outstanding principal assumed recovered',
+        },
+      ];
+      xirrFullRecovery = computeXirr(flowsWithRecovery);
+    } else {
+      // No outstanding → full recovery is the same as total loss
+      xirrFullRecovery = xirrTotalLoss;
+    }
+
+    // Projected XIRR: optimistic case (same as full recovery for now).
+    // The "total loss" floor lets users bracket the realistic range themselves.
+    const projectedXIRR = xirrFullRecovery;
+
     // Cash Flow Chart — note: collection/fee events are not visible per-day
     // until the upstream subledger is rebuilt. Chart shows deposits,
     // withdrawals, and investments only.
@@ -941,7 +1088,13 @@ export default async function handler(req, res) {
       });
     }
 
-    return { xirrFlows, cashFlowChart };
+    return {
+      xirrFlows,
+      cashFlowChart,
+      projectedXIRR,
+      xirrFullRecovery,
+      xirrTotalLoss,
+    };
   }
 
   // ==========================================================================
@@ -1163,7 +1316,7 @@ export default async function handler(req, res) {
   // 9. BUILD SUMMARY  (matches 'Returns Summary' sheet layout)
   //    Uses sub + derived + fin. Field names preserved for the frontend.
   // ==========================================================================
-  function buildSummary(perfs, sub, derived, fin, synInfo, aggregate) {
+  function buildSummary(perfs, sub, derived, fin, synInfo, aggregate, flows) {
     const sumDeal = (fn) => perfs.reduce((s, d) => s + fn(d), 0);
     const dates = perfs.map(d => d.fundedDate).filter(Boolean).sort();
     const profitCount = perfs.filter(d => d.status === 'Profit').length;
@@ -1244,7 +1397,8 @@ export default async function handler(req, res) {
         : Math.round(sumDeal(d => d.netReturn)),
       totalCurrentValue: hasSyndicator ? Math.round(fin.totalValue) : 0,
       netProfit: hasSyndicator ? Math.round(fin.netProfit) : 0,
-      projectedXIRR: 0,
+      projectedXIRR: hasSyndicator && flows?.projectedXIRR != null
+        ? round2(flows.projectedXIRR) : 0,
       cashOnCashMultiple: hasSyndicator ? fin.cashOnCash : 0,
 
       // Deal Statistics (rows 51-57)
@@ -1266,8 +1420,10 @@ export default async function handler(req, res) {
       pctStillOutstanding: hasSyndicator && totalInvested > 0
         ? round2(fin.unreturned / totalInvested)
         : 0,
-      xirrFullRecovery: 0,
-      xirrTotalLoss: 0,
+      xirrFullRecovery: hasSyndicator && flows?.xirrFullRecovery != null
+        ? round2(flows.xirrFullRecovery) : 0,
+      xirrTotalLoss: hasSyndicator && flows?.xirrTotalLoss != null
+        ? round2(flows.xirrTotalLoss) : 0,
 
       // Collection Analysis (business-level, from deals)
       totalNetFunded: Math.round(sumDeal(d => d.netFunded)),
@@ -1330,7 +1486,13 @@ export default async function handler(req, res) {
     let derived = null;   // syndications-derived: per-deal slice + collection breakdown
     let fin = null;       // combined: cashBalance, unreturned, totalValue, netProfit, etc.
     let feeConfig = null;
-    let flows = { xirrFlows: [], cashFlowChart: [] };
+    let flows = {
+      xirrFlows: [],
+      cashFlowChart: [],
+      projectedXIRR: null,
+      xirrFullRecovery: null,
+      xirrTotalLoss: null,
+    };
 
     if (syndicatorId) {
       synInfo = allSyndicators.find(c => c.id === syndicatorId) || null;
@@ -1444,7 +1606,7 @@ export default async function handler(req, res) {
       );
     }
 
-    const summary = buildSummary(dealPerf, sub, derived, fin, synInfo, aggregate);
+    const summary = buildSummary(dealPerf, sub, derived, fin, synInfo, aggregate, flows);
 
     const vintagesBiz = vintagesSynd.map(v => ({
       vintage: v.vintage,
