@@ -56,18 +56,56 @@
 //       exponential backoff (100ms, 300ms, 900ms before each retry).
 //     - 4xx responses (auth, not-found, bad-request) → fail immediately.
 //       These are deterministic errors that won't resolve by retrying.
-//     - 408/429 (timeout, rate limit) → retried like 5xx because they're
-//       transient even though they're 4xx.
+//     - 429 (rate limit) → retry with LONG backoff (30s+) since the rate
+//       limiter should prevent these in the first place; if we hit one,
+//       we're out of sync and need to wait the rest of the window.
+//     - 408/504 (timeouts) → retried like 5xx because they're transient.
+//
+//   Rate limiting:
+//     - SmartMCA enforces 60 requests/minute. We self-throttle to 50/minute
+//       (17% headroom) using a sliding-window token bucket. Cache hits do
+//       NOT consume tokens (only upstream calls do).
+//     - Module-scoped, so all concurrent requests on the same warm instance
+//       share the same budget. Multiple Vercel instances can still race,
+//       but at this scale that's a tolerable risk.
 //
 //   Bypass: append ?nocache=1 to any request to force a fresh fetch.
 // ============================================================================
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const cache = new Map(); // path -> { value, expiresAt }
-let cacheStats = { hits: 0, misses: 0, bypasses: 0, retries: 0, fails: 0 };
+let cacheStats = { hits: 0, misses: 0, bypasses: 0, retries: 0, fails: 0, rateLimitWaits: 0, rateLimitWaitMs: 0 };
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
-const BACKOFF_MS = [100, 300, 900]; // delays before each attempt (first is 0 effectively)
+const BACKOFF_MS = [200, 800, 2000]; // baseline backoff for 5xx/network errors
+const RATE_LIMIT_BACKOFF_MS = 31000; // wait full minute window when 429 hit (server slate clean)
+
+// Sliding-window rate limiter (50 requests per 60 seconds).
+// Holds timestamps of the last N upstream fetches. Before each new fetch,
+// if N timestamps are within the last 60s, wait until the oldest expires.
+const RATE_LIMIT_MAX = 50;
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const requestTimestamps = []; // sorted: oldest first
+
+async function acquireRateLimitToken() {
+  while (true) {
+    const now = Date.now();
+    // Prune timestamps older than the window
+    while (requestTimestamps.length > 0 && requestTimestamps[0] <= now - RATE_LIMIT_WINDOW_MS) {
+      requestTimestamps.shift();
+    }
+    if (requestTimestamps.length < RATE_LIMIT_MAX) {
+      requestTimestamps.push(now);
+      return;
+    }
+    // Bucket full. Sleep until the oldest token ages out, then re-check.
+    const waitMs = requestTimestamps[0] + RATE_LIMIT_WINDOW_MS - now + 50; // +50ms safety
+    cacheStats.rateLimitWaits++;
+    cacheStats.rateLimitWaitMs += waitMs;
+    await sleep(waitMs);
+    // Loop and re-check (in case multiple workers were waiting on the same slot)
+  }
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -87,25 +125,30 @@ async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
   }
 
   // Retry loop: up to MAX_ATTEMPTS, with exponential backoff.
+  // Rate limit token is acquired before EACH attempt (including retries),
+  // so a retried request honors the rate limit just like a fresh one.
   let lastError = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (attempt > 0) {
       cacheStats.retries++;
-      await sleep(BACKOFF_MS[attempt - 1]);
+      // 429 gets a long wait (whole window). Other transient errors get
+      // exponential backoff.
+      const isRateLimited = lastError && lastError.status === 429;
+      const backoff = isRateLimited ? RATE_LIMIT_BACKOFF_MS : BACKOFF_MS[attempt - 1];
+      await sleep(backoff);
     }
+    // Acquire rate-limit token before hitting upstream.
+    await acquireRateLimitToken();
     try {
       const resp = await fetch(`${apiBase}${path}`, {
         headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       });
       if (resp.ok) {
         const value = await resp.json();
-        cache.set(path, { value, fetchedAt: now, expiresAt: now + CACHE_TTL_MS });
+        cache.set(path, { value, fetchedAt: Date.now(), expiresAt: Date.now() + CACHE_TTL_MS });
         cacheStats.misses++;
 
         // Opportunistic eviction: cap memory if cache grows past 200 entries.
-        // Bumped from 50 to handle the new architecture's per-deal fetches
-        // (~75 paths per cold request when both deal-detail and payments are
-        // hit). Drops the oldest by fetchedAt.
         if (cache.size > 200) {
           const oldestKey = [...cache.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0][0];
           cache.delete(oldestKey);
@@ -258,10 +301,13 @@ export default async function handler(req, res) {
     }
 
     // Step 2: hydrate each deal with the full record (which includes syndications)
+    // Concurrency=3: with the 50/min rate limit, cranking workers higher just
+    // means more of them parked waiting on the rate-limit token bucket. 3 is
+    // enough to keep the bucket draining steadily.
     const results = await pMap(shells, async (shell) => {
       const full = await apiFetch(`/deals/${shell.id}`);
       return full.data || full;
-    }, 6);
+    }, 3);
 
     // Stitch results: use full record where available, shell where not.
     return results.map((res, i) => {
@@ -547,10 +593,13 @@ export default async function handler(req, res) {
     if (fetchPayments) {
       // Bounded-concurrency per-deal payment fetches. Each retries up to 3x
       // in cachedApiFetch; failures here mean even retries didn't recover.
+      // Concurrency=3 (matching the deal-detail fan-out) for the same rate-
+      // limit reason — more workers don't help when a global throttle is
+      // pacing actual upstream requests.
       const paymentResults = await pMap(perDealShares, async ({ dealInternalId }) => {
         const r = await fetchPayments(dealInternalId);
         return r.data || [];
-      }, 6);
+      }, 3);
 
       for (let i = 0; i < paymentResults.length; i++) {
         const res = paymentResults[i];
