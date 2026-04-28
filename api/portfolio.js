@@ -51,15 +51,27 @@
 //   TTL. Cold starts and concurrent instances each get their own cache — that
 //   is OK at this scale.
 //
-//   Why cache the upstream responses (not the final JSON)? So response-shape
-//   changes during a refactor don't get served from a stale cache. The
-//   derivation pipeline (parse, derive, combine, summarize) is fast — ~ms.
+//   Retry semantics:
+//     - Network errors (fetch threw) and 5xx responses → retry up to 3x with
+//       exponential backoff (100ms, 300ms, 900ms before each retry).
+//     - 4xx responses (auth, not-found, bad-request) → fail immediately.
+//       These are deterministic errors that won't resolve by retrying.
+//     - 408/429 (timeout, rate limit) → retried like 5xx because they're
+//       transient even though they're 4xx.
 //
 //   Bypass: append ?nocache=1 to any request to force a fresh fetch.
 // ============================================================================
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const cache = new Map(); // path -> { value, expiresAt }
-let cacheStats = { hits: 0, misses: 0, bypasses: 0 };
+let cacheStats = { hits: 0, misses: 0, bypasses: 0, retries: 0, fails: 0 };
+
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const BACKOFF_MS = [100, 300, 900]; // delays before each attempt (first is 0 effectively)
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
   const now = Date.now();
@@ -74,24 +86,85 @@ async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
     cacheStats.bypasses++;
   }
 
-  const resp = await fetch(`${apiBase}${path}`, {
-    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-  });
-  if (!resp.ok) throw new Error(`${resp.status} on ${path}: ${await resp.text()}`);
-  const value = await resp.json();
+  // Retry loop: up to MAX_ATTEMPTS, with exponential backoff.
+  let lastError = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      cacheStats.retries++;
+      await sleep(BACKOFF_MS[attempt - 1]);
+    }
+    try {
+      const resp = await fetch(`${apiBase}${path}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      });
+      if (resp.ok) {
+        const value = await resp.json();
+        cache.set(path, { value, fetchedAt: now, expiresAt: now + CACHE_TTL_MS });
+        cacheStats.misses++;
 
-  cache.set(path, { value, fetchedAt: now, expiresAt: now + CACHE_TTL_MS });
-  cacheStats.misses++;
+        // Opportunistic eviction: cap memory if cache grows past 200 entries.
+        // Bumped from 50 to handle the new architecture's per-deal fetches
+        // (~75 paths per cold request when both deal-detail and payments are
+        // hit). Drops the oldest by fetchedAt.
+        if (cache.size > 200) {
+          const oldestKey = [...cache.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0][0];
+          cache.delete(oldestKey);
+        }
+        return { data: value, cached: false, ageSec: 0 };
+      }
 
-  // Opportunistic eviction: if cache grows past 50 entries, drop the oldest.
-  // 50 is well above what one syndicator generates (~3 paths) but caps memory
-  // usage if a misconfigured client cycles through syndicator IDs.
-  if (cache.size > 50) {
-    const oldestKey = [...cache.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0][0];
-    cache.delete(oldestKey);
+      // Non-2xx response. Decide whether to retry.
+      const errBody = await resp.text();
+      lastError = new Error(`${resp.status} on ${path}: ${errBody}`);
+      lastError.status = resp.status;
+
+      if (!RETRYABLE_STATUS.has(resp.status)) {
+        // 4xx (other than 408/429) — terminal, no retry
+        break;
+      }
+      // Otherwise fall through to retry
+    } catch (err) {
+      // Network error (fetch threw). Always retryable.
+      lastError = err;
+    }
   }
 
-  return { data: value, cached: false, ageSec: 0 };
+  cacheStats.fails++;
+  throw lastError || new Error(`fetch failed after ${MAX_ATTEMPTS} attempts: ${path}`);
+}
+
+// ============================================================================
+// BOUNDED-CONCURRENCY MAP
+//   Like Promise.all(items.map(fn)) but caps the number of in-flight calls.
+//   Critical for our fan-out architecture: 37 deal-detail + 37 payment fetches
+//   blasted in parallel overwhelms both the upstream API and our serverless
+//   function instance. Concurrency=6 keeps the pipeline saturated without
+//   triggering connection-pool exhaustion or rate limits.
+//
+//   Failures are isolated to the individual item — one fetch failing doesn't
+//   abort the rest. Returns { value, error } pairs so the caller can decide
+//   how to handle partial results.
+// ============================================================================
+async function pMap(items, fn, concurrency = 6) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= items.length) return;
+      try {
+        results[i] = { value: await fn(items[i], i), error: null };
+      } catch (err) {
+        results[i] = { value: null, error: err };
+      }
+    }
+  }
+
+  // Spawn `concurrency` workers; each pulls from the shared queue until empty
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 // ============================================================================
@@ -155,9 +228,10 @@ export default async function handler(req, res) {
     return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
   }
 
-  // ==========================================================================
-  // 1. FETCH ALL DEALS (page-based pagination)
-  // ==========================================================================
+  // Per-request failure tracker: deals that couldn't be hydrated, and any
+  // payment fetches that failed. Surfaced in _debug so degradation is visible.
+  const fetchFailures = { deals: [], payments: [] };
+
   // ==========================================================================
   // 1. FETCH ALL DEALS
   //    The /deals?limit=100&page=N list endpoint returns a "shell" deal
@@ -166,9 +240,11 @@ export default async function handler(req, res) {
   //    compute per-syndicator funded/collected exactly, so we batch-fetch
   //    detail for every deal.
   //
-  //    Cost: ~38 API calls instead of 1. With our 5-minute cache the cold-
-  //    start path adds ~10s; warm requests are unaffected. Acceptable at
-  //    current 5-user scale.
+  //    Concurrency-bounded via pMap (default 6) to avoid overwhelming the
+  //    upstream API on cold-cache requests. Each individual fetch retries up
+  //    to 3 times with backoff (in cachedApiFetch). Failures fall back to
+  //    the shell record AND get logged in fetchFailures.deals so the caller
+  //    can see which deals contributed degraded data.
   // ==========================================================================
   async function getAllDeals() {
     // Step 1: get the shell list (paginated)
@@ -182,21 +258,23 @@ export default async function handler(req, res) {
     }
 
     // Step 2: hydrate each deal with the full record (which includes syndications)
-    // Use Promise.all for parallelism — these all hit the cache layer so warm
-    // requests skip the upstream entirely. Cold requests run in parallel.
-    const detailed = await Promise.all(shells.map(async (shell) => {
-      try {
-        const full = await apiFetch(`/deals/${shell.id}`);
-        // The detail endpoint returns { data: {...} } shape
-        return full.data || full;
-      } catch (e) {
-        // If detail fetch fails, fall back to the shell. Loses syndications
-        // for this deal but keeps the pipeline running.
-        return shell;
-      }
-    }));
+    const results = await pMap(shells, async (shell) => {
+      const full = await apiFetch(`/deals/${shell.id}`);
+      return full.data || full;
+    }, 6);
 
-    return detailed;
+    // Stitch results: use full record where available, shell where not.
+    return results.map((res, i) => {
+      if (res.error) {
+        fetchFailures.deals.push({
+          dealId: shells[i].dealId,
+          internalId: shells[i].id,
+          error: res.error.message,
+        });
+        return shells[i]; // fall back to shell (no syndications)
+      }
+      return res.value;
+    });
   }
 
   // Find a specific syndicator's slice of a deal. Returns null if the
@@ -467,17 +545,27 @@ export default async function handler(req, res) {
     let paymentRecordCount = 0;
 
     if (fetchPayments) {
-      // Parallelize per-deal payment fetches — all hit the cache layer.
-      const paymentResults = await Promise.all(perDealShares.map(async ({ dealInternalId, sharePct }) => {
-        try {
-          const r = await fetchPayments(dealInternalId);
-          return { sharePct, payments: r.data || [] };
-        } catch (e) {
-          return { sharePct, payments: [] };
-        }
-      }));
+      // Bounded-concurrency per-deal payment fetches. Each retries up to 3x
+      // in cachedApiFetch; failures here mean even retries didn't recover.
+      const paymentResults = await pMap(perDealShares, async ({ dealInternalId }) => {
+        const r = await fetchPayments(dealInternalId);
+        return r.data || [];
+      }, 6);
 
-      for (const { sharePct, payments } of paymentResults) {
+      for (let i = 0; i < paymentResults.length; i++) {
+        const res = paymentResults[i];
+        const { dealInternalId, dealNo, sharePct } = perDealShares[i];
+
+        if (res.error) {
+          fetchFailures.payments.push({
+            dealId: dealNo,
+            internalId: dealInternalId,
+            error: res.error.message,
+          });
+          continue; // skip this deal's payments — already logged
+        }
+
+        const payments = res.value;
         for (const p of payments) {
           if (p.status !== 'cleared') continue; // ignore pending/failed
           const amt = num(p.amount) * sharePct;
@@ -1020,6 +1108,15 @@ export default async function handler(req, res) {
           lifetimeStats: { ...cacheStats },
           bypassed: bypass,
         },
+        // Per-request fetch failures: deals or payment endpoints whose retries
+        // were all exhausted. Populated => some fields will under-count.
+        // Empty arrays => all upstream fetches succeeded.
+        fetchFailures: {
+          dealCount: fetchFailures.deals.length,
+          paymentCount: fetchFailures.payments.length,
+          deals: fetchFailures.deals,
+          payments: fetchFailures.payments,
+        },
       },
       _meta: {
         fetchedAt: new Date().toISOString(),
@@ -1031,6 +1128,12 @@ export default async function handler(req, res) {
         cacheStatus: fetchTrace.every(f => f.cached) ? 'all-cached'
           : fetchTrace.some(f => f.cached) ? 'partial-cache'
           : 'fresh',
+        // 'complete' = all per-deal fetches succeeded; 'partial' = at least one
+        // deal-detail or payment fetch failed all retries (numbers may under-count).
+        // The fetchFailures block in _debug shows which deals.
+        dataIntegrity: (fetchFailures.deals.length === 0 && fetchFailures.payments.length === 0)
+          ? 'complete'
+          : 'partial',
         notes: syndicatorId
           ? 'Investment, collections, and exposure are read from each deal\'s syndications array (exact). Collection breakdown by type comes from /deals/{id}/payments scaled by investmentPercentage. Cash flows (deposits/withdrawals) come from the syndicator subledger. Mgmt fees and residual commissions are derived from per-syndicator rate config (managementFeeAmount and commissionPercentage in the API are zero/null across observed deals).'
           : null,
