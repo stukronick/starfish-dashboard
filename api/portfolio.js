@@ -564,7 +564,12 @@ export default async function handler(req, res) {
 
     for (const deal of deals) {
       const synd = extractSyndicationFor(deal, syndicatorId);
+      // Skip if no syndication record OR zero-stake (sometimes syndicators
+      // are listed in the array with fundedAmount=0; not real participation).
+      // Treating these as participating would inflate counts and pollute
+      // vintages/curves with empty rows.
       if (!synd) continue;
+      if (num(synd.fundedAmount) <= 0) continue;
 
       dealsParticipated++;
       syndInvested += num(synd.fundedAmount);
@@ -1217,11 +1222,23 @@ export default async function handler(req, res) {
     }
 
     // 4. Build the deal-perf table. When a syndicator is selected, each row
-    // shows that syndicator's slice. When not selected, business-level numbers.
-    const dealPerf = deals.map(d => {
-      const synd = syndicatorId ? extractSyndicationFor(d, syndicatorId) : null;
-      return mapDeal(d, synd);
-    });
+    // shows that syndicator's slice. Deals where the syndicator doesn't
+    // participate (no syndication record, or fundedAmount=0) are filtered
+    // OUT entirely — they shouldn't appear in deal tables, vintage rollups,
+    // or collection curves for that syndicator's view.
+    // When no syndicator is selected (Portfolio Overview), all deals are
+    // included with business-level numbers.
+    const dealPerf = deals
+      .map(d => {
+        const synd = syndicatorId ? extractSyndicationFor(d, syndicatorId) : null;
+        return mapDeal(d, synd);
+      })
+      .filter(d => {
+        // Portfolio view: keep all deals
+        if (!syndicatorId) return true;
+        // Syndicator view: drop deals with zero participation
+        return d.syndPct > 0 && d.invested > 0;
+      });
 
     // 5. Compute vintages
     const vintagesSynd = computeVintages(dealPerf);
