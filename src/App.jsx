@@ -589,10 +589,30 @@ export default function App() {
     return (
       <div style={{ minHeight: "100vh", background: "#EFF8FF", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Inria Sans', sans-serif" }}>
         <link href="https://fonts.googleapis.com/css2?family=Inria+Sans:wght@300;400;700&display=swap" rel="stylesheet" />
-        <div style={{ textAlign: "center" }}>
+        <div style={{ textAlign: "center", maxWidth: 420, padding: "0 24px" }}>
           <img src={LOGO} alt="Starfish Advance" style={{ height: 64, width: 64, borderRadius: 12, marginBottom: 16 }} />
           <div style={{ color: "#084372", fontSize: 18, fontWeight: 700 }}>Starfish Advance</div>
-          <div style={{ color: "#5a7a9a", fontSize: 13, marginTop: 8 }}>Loading portfolio data...</div>
+          <div style={{ color: "#5a7a9a", fontSize: 14, marginTop: 12, fontWeight: 600 }}>Loading live data from SmartMCA...</div>
+          <div style={{ color: "#7a93b3", fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
+            Cold loads can take up to a minute on the first request of the day.
+            Subsequent loads in the next 5 minutes will be instant.
+          </div>
+          {/* Animated dot indicator (CSS-only) */}
+          <div style={{ marginTop: 20, display: "flex", justifyContent: "center", gap: 6 }}>
+            {[0, 1, 2].map(i => (
+              <span key={i} style={{
+                width: 8, height: 8, borderRadius: "50%",
+                background: "#0596F2",
+                animation: `pulse 1.4s ease-in-out ${i * 0.2}s infinite`,
+              }} />
+            ))}
+          </div>
+          <style>{`
+            @keyframes pulse {
+              0%, 60%, 100% { opacity: 0.3; transform: scale(0.85); }
+              30% { opacity: 1; transform: scale(1); }
+            }
+          `}</style>
         </div>
       </div>
     );
@@ -658,6 +678,29 @@ export default function App() {
           {error && <span style={{ color: "#CC0000" }}>API: {error}</span>}
         </div>
       </div>
+
+      {/* Banners: warn if data is degraded or fallback */}
+      {source === 'fallback' && (
+        <div style={{ background: "#FFF4E5", borderBottom: "1px solid #FD8E3A", padding: "10px 32px" }}>
+          <div style={{ maxWidth: 1400, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 13, color: "#7C4A00" }}>
+            <span>⚠ <b>Showing sample data.</b> The SmartMCA API is unreachable or timed out. Numbers below are not live.</span>
+            <button onClick={refresh} style={{ background: "#FD8E3A", color: "#fff", border: "none", borderRadius: 6, padding: "5px 14px", cursor: "pointer", fontFamily: "'Inria Sans'", fontSize: 12, fontWeight: 600 }}>Retry</button>
+          </div>
+        </div>
+      )}
+      {source === 'live' && DATA?._meta?.dataIntegrity === 'partial' && (
+        <div style={{ background: "#FFF8E1", borderBottom: "1px solid #E8B400", padding: "10px 32px" }}>
+          <div style={{ maxWidth: 1400, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 13, color: "#7A5C00" }}>
+            <span>
+              ⚠ <b>Some data is incomplete.</b>{' '}
+              {DATA._debug?.fetchFailures?.dealCount > 0 && `${DATA._debug.fetchFailures.dealCount} deal(s) couldn't be loaded. `}
+              {DATA._debug?.fetchFailures?.paymentCount > 0 && `${DATA._debug.fetchFailures.paymentCount} payment fetch(es) failed. `}
+              Numbers shown may under-count.
+            </span>
+            <button onClick={refresh} style={{ background: "#E8B400", color: "#fff", border: "none", borderRadius: 6, padding: "5px 14px", cursor: "pointer", fontFamily: "'Inria Sans'", fontSize: 12, fontWeight: 600 }}>Refresh</button>
+          </div>
+        </div>
+      )}
 
       {/* Body */}
       <div style={{ maxWidth: 1400, margin: "0 auto", padding: "32px 32px 64px" }}>
