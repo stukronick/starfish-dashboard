@@ -57,23 +57,118 @@
 //     - 4xx responses (auth, not-found, bad-request) → fail immediately.
 //       These are deterministic errors that won't resolve by retrying.
 //     - 429 (rate limit) → retry with LONG backoff (30s+) since the rate
-//       limiter should prevent these in the first place; if we hit one,
-//       we're out of sync and need to wait the rest of the window.
-//     - 408/504 (timeouts) → retried like 5xx because they're transient.
-//
-//   Rate limiting:
-//     - SmartMCA enforces 60 requests/minute. We self-throttle to 50/minute
-//       (17% headroom) using a sliding-window token bucket. Cache hits do
-//       NOT consume tokens (only upstream calls do).
-//     - Module-scoped, so all concurrent requests on the same warm instance
-//       share the same budget. Multiple Vercel instances can still race,
-//       but at this scale that's a tolerable risk.
-//
-//   Bypass: append ?nocache=1 to any request to force a fresh fetch.
 // ============================================================================
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const cache = new Map(); // path -> { value, expiresAt }
-let cacheStats = { hits: 0, misses: 0, bypasses: 0, retries: 0, fails: 0, rateLimitWaits: 0, rateLimitWaitMs: 0 };
+// CACHE: TWO-TIER (in-memory + Vercel KV)
+//
+//   Tier 1 — in-memory (Map): sub-ms reads, lives only for this function
+//   instance's warm period (~5-15 min idle, killed on deploy/scaling).
+//
+//   Tier 2 — Vercel KV: ~5-15ms reads, persists across instances and deploys.
+//   Survives function restarts; survives the SmartMCA rate-limit window.
+//   This tier is what makes cold loads fast — a fresh function instance
+//   inherits the cache from previous runs.
+//
+//   Lookup order: memory → KV → upstream. Upstream populates both tiers.
+//
+//   TTL by path (chosen so users see numbers no more than ~30min stale,
+//   while minimizing upstream load):
+//     /deals/{id} for closed/defaulted deals       → 24h (data is frozen)
+//     /deals/{id}/payments for closed/defaulted    → 24h
+//     /deals/{id} for active deals                 → 30min
+//     /deals/{id}/payments for active deals        → 30min
+//     /deals?... (list)                            → 30min
+//     /contacts?...                                → 1h
+//     /accounting/reports/subledger/...            → 5min (cash flows live)
+//     unknown                                      → 30min default
+//
+//   Status-based TTL upgrade: when we first fetch a deal, we don't yet know
+//   if it's closed. We cache with the conservative (active) TTL. After the
+//   deal record arrives, getAllDeals upgrades closed-deal entries to 24h
+//   via a second KV write.
+//
+//   KV is wired through @vercel/kv. If env vars aren't set (local dev
+//   without KV configured, or KV unreachable), all KV operations no-op
+//   silently and we fall back to the in-memory tier alone.
+//
+//   Bypass: append ?nocache=1 to skip both tiers and force a fresh fetch.
+// ============================================================================
+
+// Optional KV import — wrapped so the module loads even if @vercel/kv isn't
+// installed or env vars aren't configured.
+let kvClient = null;
+let kvAvailable = false;
+async function initKv() {
+  if (kvClient !== null) return; // already attempted
+  try {
+    if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) {
+      kvClient = false;
+      return;
+    }
+    const mod = await import('@vercel/kv');
+    kvClient = mod.kv;
+    kvAvailable = true;
+  } catch (err) {
+    // Package not installed or import failed — fall through to in-memory only
+    kvClient = false;
+    kvAvailable = false;
+  }
+}
+
+const TTL = {
+  ACTIVE_DEAL: 30 * 60,           // 30 min in seconds (KV uses seconds)
+  CLOSED_DEAL: 24 * 60 * 60,      // 24 hours
+  DEAL_LIST: 30 * 60,             // 30 min
+  CONTACTS: 60 * 60,              // 1 hour
+  SUBLEDGER: 5 * 60,              // 5 min
+  DEFAULT: 30 * 60,               // 30 min
+};
+
+// Pick TTL (in seconds) based on path. For deal-specific paths we don't
+// yet know status — getAllDeals will upgrade closed ones via setKv after.
+function pickTtlSeconds(path) {
+  if (path.startsWith('/deals?')) return TTL.DEAL_LIST;
+  if (/^\/deals\/[^/]+\/payments/.test(path)) return TTL.ACTIVE_DEAL; // upgraded later
+  if (/^\/deals\/[^/?]+$/.test(path)) return TTL.ACTIVE_DEAL;          // upgraded later
+  if (path.startsWith('/contacts?')) return TTL.CONTACTS;
+  if (path.includes('/accounting/reports/subledger/')) return TTL.SUBLEDGER;
+  return TTL.DEFAULT;
+}
+
+// In-memory tier (unchanged from before)
+const cache = new Map(); // path -> { value, expiresAt (ms epoch), fetchedAt (ms epoch) }
+let cacheStats = {
+  hits: 0, misses: 0, bypasses: 0, retries: 0, fails: 0,
+  rateLimitWaits: 0, rateLimitWaitMs: 0,
+  kvHits: 0, kvMisses: 0, kvWrites: 0, kvErrors: 0,
+};
+
+async function getKv(path) {
+  await initKv();
+  if (!kvAvailable) return null;
+  try {
+    const value = await kvClient.get(path);
+    if (value !== null && value !== undefined) {
+      cacheStats.kvHits++;
+      return value;
+    }
+    cacheStats.kvMisses++;
+    return null;
+  } catch (err) {
+    cacheStats.kvErrors++;
+    return null;
+  }
+}
+
+async function setKv(path, value, ttlSeconds) {
+  await initKv();
+  if (!kvAvailable) return;
+  try {
+    await kvClient.set(path, value, { ex: ttlSeconds });
+    cacheStats.kvWrites++;
+  } catch (err) {
+    cacheStats.kvErrors++;
+  }
+}
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
@@ -115,29 +210,37 @@ async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
   const now = Date.now();
 
   if (!bypass) {
+    // Tier 1: in-memory
     const entry = cache.get(path);
     if (entry && entry.expiresAt > now) {
       cacheStats.hits++;
-      return { data: entry.value, cached: true, ageSec: Math.floor((now - entry.fetchedAt) / 1000) };
+      return { data: entry.value, cached: true, tier: 'memory', ageSec: Math.floor((now - entry.fetchedAt) / 1000) };
+    }
+
+    // Tier 2: Vercel KV
+    const kvHit = await getKv(path);
+    if (kvHit !== null) {
+      // Repopulate in-memory tier so subsequent calls in this request are fast.
+      // Use a short in-memory expiry (1 min) — KV is the source of truth for
+      // cross-instance correctness, and we don't know exactly how much time
+      // the KV entry has left, so we re-validate via KV after that minute.
+      const inMemTtl = 60 * 1000;
+      cache.set(path, { value: kvHit, fetchedAt: now, expiresAt: now + inMemTtl });
+      return { data: kvHit, cached: true, tier: 'kv', ageSec: 0 };
     }
   } else {
     cacheStats.bypasses++;
   }
 
-  // Retry loop: up to MAX_ATTEMPTS, with exponential backoff.
-  // Rate limit token is acquired before EACH attempt (including retries),
-  // so a retried request honors the rate limit just like a fresh one.
+  // Tier 3: upstream API. Retry loop with rate limiting and exponential backoff.
   let lastError = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (attempt > 0) {
       cacheStats.retries++;
-      // 429 gets a long wait (whole window). Other transient errors get
-      // exponential backoff.
       const isRateLimited = lastError && lastError.status === 429;
       const backoff = isRateLimited ? RATE_LIMIT_BACKOFF_MS : BACKOFF_MS[attempt - 1];
       await sleep(backoff);
     }
-    // Acquire rate-limit token before hitting upstream.
     await acquireRateLimitToken();
     try {
       const resp = await fetch(`${apiBase}${path}`, {
@@ -145,35 +248,61 @@ async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
       });
       if (resp.ok) {
         const value = await resp.json();
-        cache.set(path, { value, fetchedAt: Date.now(), expiresAt: Date.now() + CACHE_TTL_MS });
+        const ttlSeconds = pickTtlSeconds(path);
+        const fetchTime = Date.now();
+        // Write to in-memory tier first (sync)
+        cache.set(path, { value, fetchedAt: fetchTime, expiresAt: fetchTime + ttlSeconds * 1000 });
+        // Await the KV write so the entry is durably persisted before this
+        // request returns. This adds ~5-15ms per cache miss but eliminates
+        // race conditions with subsequent code paths (e.g. the closed-deal
+        // TTL upgrade in getAllDeals) that need the write to be settled.
+        // setKv internally swallows errors so it never throws.
+        await setKv(path, value, ttlSeconds);
         cacheStats.misses++;
 
-        // Opportunistic eviction: cap memory if cache grows past 200 entries.
+        // In-memory tier eviction (KV handles its own expiry)
         if (cache.size > 200) {
           const oldestKey = [...cache.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0][0];
           cache.delete(oldestKey);
         }
-        return { data: value, cached: false, ageSec: 0 };
+        return { data: value, cached: false, tier: 'upstream', ageSec: 0 };
       }
 
-      // Non-2xx response. Decide whether to retry.
       const errBody = await resp.text();
       lastError = new Error(`${resp.status} on ${path}: ${errBody}`);
       lastError.status = resp.status;
 
       if (!RETRYABLE_STATUS.has(resp.status)) {
-        // 4xx (other than 408/429) — terminal, no retry
         break;
       }
-      // Otherwise fall through to retry
     } catch (err) {
-      // Network error (fetch threw). Always retryable.
       lastError = err;
     }
   }
 
   cacheStats.fails++;
   throw lastError || new Error(`fetch failed after ${MAX_ATTEMPTS} attempts: ${path}`);
+}
+
+// Upgrade a cached deal's TTL to 24h once we know it's closed/defaulted.
+// Called from getAllDeals after deal detail is in hand.
+async function upgradeDealTtlIfClosed(internalId, dealRecord) {
+  if (!dealRecord) return;
+  const status = dealRecord.status;
+  if (status !== 'closed' && status !== 'defaulted') return;
+
+  const dealPath = `/deals/${internalId}`;
+  const paymentsPath = `/deals/${internalId}/payments?limit=200`;
+
+  // Re-write the deal detail with longer TTL. We pass the value we already
+  // have rather than re-fetching.
+  await setKv(dealPath, { data: dealRecord }, TTL.CLOSED_DEAL).catch(() => {});
+
+  // Payments TTL upgrade: only if we have it in memory or KV
+  const paymentsInMem = cache.get(paymentsPath);
+  if (paymentsInMem) {
+    await setKv(paymentsPath, paymentsInMem.value, TTL.CLOSED_DEAL).catch(() => {});
+  }
 }
 
 // ============================================================================
@@ -255,11 +384,17 @@ export default async function handler(req, res) {
   const { syndicatorId, nocache } = req.query;
   const bypass = nocache === '1' || nocache === 'true';
 
-  // Per-request fetch tracker: which paths were hit, were they cached, ages.
+  // Per-request fetch tracker: which paths were hit, were they cached, ages,
+  // and which tier served them (memory / kv / upstream).
   const fetchTrace = [];
   async function apiFetch(path) {
     const result = await cachedApiFetch(path, API_KEY, API_BASE, { bypass });
-    fetchTrace.push({ path, cached: result.cached, ageSec: result.ageSec });
+    fetchTrace.push({
+      path,
+      cached: result.cached,
+      tier: result.tier || 'upstream',
+      ageSec: result.ageSec,
+    });
     return result.data;
   }
 
@@ -310,7 +445,7 @@ export default async function handler(req, res) {
     }, 3);
 
     // Stitch results: use full record where available, shell where not.
-    return results.map((res, i) => {
+    const stitched = results.map((res, i) => {
       if (res.error) {
         fetchFailures.deals.push({
           dealId: shells[i].dealId,
@@ -321,6 +456,17 @@ export default async function handler(req, res) {
       }
       return res.value;
     });
+
+    // After we know each deal's status, upgrade closed/defaulted deals in
+    // KV to a 24h TTL. We await this (rather than fire-and-forget) because
+    // racing with the initial setKv from cachedApiFetch is non-deterministic
+    // — last-writer-wins, and we need the upgrade to win. Cost is small:
+    // at most a handful of KV set calls, run in parallel.
+    try {
+      await Promise.all(stitched.map(deal => upgradeDealTtlIfClosed(deal.id, deal)));
+    } catch { /* best-effort optimization, swallow errors */ }
+
+    return stitched;
   }
 
   // Find a specific syndicator's slice of a deal. Returns null if the
@@ -1362,12 +1508,16 @@ export default async function handler(req, res) {
           source: SYNDICATOR_FEE_CONFIG[syndicatorId] ? 'explicit' : 'default',
         } : null,
         cache: {
-          ttlSec: CACHE_TTL_MS / 1000,
+          // TTLs (in seconds) by path category
+          ttls: TTL,
+          // Whether KV (persistent tier) is connected
+          kvAvailable: kvAvailable,
           // Per-request: which upstream paths we hit and whether each was cached
           fetches: fetchTrace,
           hitsThisRequest: fetchTrace.filter(f => f.cached).length,
           missesThisRequest: fetchTrace.filter(f => !f.cached).length,
-          // Lifetime stats since this serverless instance warmed up
+          // Lifetime stats since this serverless instance warmed up.
+          // Includes new KV stats: kvHits, kvMisses, kvWrites, kvErrors.
           lifetimeStats: { ...cacheStats },
           bypassed: bypass,
         },
