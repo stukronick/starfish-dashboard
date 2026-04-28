@@ -594,7 +594,7 @@ export default function App() {
           <div style={{ color: "#084372", fontSize: 18, fontWeight: 700 }}>Starfish Advance</div>
           <div style={{ color: "#5a7a9a", fontSize: 14, marginTop: 12, fontWeight: 600 }}>Loading live data from SmartMCA...</div>
           <div style={{ color: "#7a93b3", fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
-            Cold loads can take up to a minute on the first request of the day.
+            Cold loads can take up to two minutes on the first request of the day.
             Subsequent loads in the next 5 minutes will be instant.
           </div>
           {/* Animated dot indicator (CSS-only) */}

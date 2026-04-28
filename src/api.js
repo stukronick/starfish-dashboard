@@ -1,9 +1,9 @@
 // src/api.js — Frontend API client with syndicator support
 //
 // Notes on timeouts:
-//   /api/portfolio can take up to 60s on a cold cache (Vercel function
-//   maxDuration is 60s; we pad the browser-side timeout to 90s to make
-//   sure the browser doesn't abort before the function finishes).
+//   /api/portfolio can take up to ~120s on a cold cache (Vercel function
+//   maxDuration is 120s on Pro; we pad the browser-side timeout to 150s
+//   to make sure the browser doesn't abort before the function finishes).
 //   Other endpoints are quick — 15s default.
 
 const BASE = '/api';
@@ -35,9 +35,9 @@ export async function fetchSyndicators() {
 
 export async function fetchPortfolio(syndicatorId) {
   const params = syndicatorId ? `?syndicatorId=${syndicatorId}` : '';
-  // 90s timeout: server can take up to 60s (maxDuration in vercel.json),
-  // plus network overhead + buffer for retries inside the function.
-  const resp = await fetchWithTimeout(`${BASE}/portfolio${params}`, {}, 90000);
+  // 150s timeout: server can take up to 120s (maxDuration in vercel.json on
+  // Pro plan), plus network overhead + buffer for retries inside the function.
+  const resp = await fetchWithTimeout(`${BASE}/portfolio${params}`, {}, 150000);
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ error: resp.statusText }));
     throw new Error(err.error || `HTTP ${resp.status}`);
