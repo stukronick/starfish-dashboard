@@ -893,32 +893,50 @@ export default async function handler(req, res) {
         : sub.totalInvestmentsLedger;
 
     // ========================================================================
-    // CASH BALANCE — uses SmartMCA's `details.runningBalance` from contacts.
-    // This is the canonical SmartMCA-side balance figure. NOTE: it does NOT
-    // currently match the "Available" figure shown in the SmartMCA UI; the
-    // UI's number comes from a separate computation we don't yet have access
-    // to via the public API. SmartMCA support has been queried for the
-    // canonical syndicator-balance endpoint.
-    //
-    // The previous formula (Deposits − Investments + Collections − Fees −
-    // Withdrawals) double-counted collections (they're already netted into
-    // the deposits via reinvestments) and over-subtracted derived fees.
-    // Removed in favor of trusting the system-of-record value SmartMCA
-    // returns directly.
-    //
-    // Fallback to derived formula only if synInfo.runningBalance is missing.
+    // FEES — prefer canonical value from /syndicators/export when available.
+    // synInfo.managementFees is ALL-IN fees (upfront feeDeduction entries +
+    // per-payment syndicationFee entries combined). We can't yet split into
+    // "Management Fee (One-Time)" vs "Fee Paid (Per Transaction)" without
+    // parsing the full statement (Phase 2 task). For now, attribute the
+    // entire amount to the managementFees bucket and zero out residuals;
+    // the dashboard collapses these into a single "Total Fees Paid" row.
     // ========================================================================
-    const cashBalance = (synInfo && synInfo.runningBalance != null)
-      ? round2(synInfo.runningBalance)
+    let managementFees, residualCommissions, totalFees, feeSource;
+    if (synInfo && synInfo.managementFees != null) {
+      totalFees = round2(synInfo.managementFees);
+      managementFees = totalFees;
+      residualCommissions = 0;
+      feeSource = 'smartmca_breakdown';
+    } else {
+      // Fallback: use whatever derived produced (currently $0 with zeroed
+      // SYNDICATOR_FEE_CONFIG rates, until statement parsing lands).
+      managementFees = round2((derived && derived.managementFees) || 0);
+      residualCommissions = round2((derived && derived.residualCommissions) || 0);
+      totalFees = round2(managementFees + residualCommissions);
+      feeSource = (derived && derived.feeSource) || 'derived';
+    }
+
+    // ========================================================================
+    // CASH BALANCE — uses SmartMCA's `availableCash` from /syndicators/export.
+    // This is the canonical balance that matches the in-app party page
+    // exactly. Computed server-side as:
+    //   availableCash = totalDeposited - totalWithdrawn - totalInvestedLedger
+    //                 - commissionsObligated + cashCollectedGross - managementFees
+    //
+    // Falls back to the derived formula only if synInfo.availableCash is
+    // missing (e.g., /syndicators/export call failed for this request).
+    // ========================================================================
+    const cashBalance = (synInfo && synInfo.availableCash != null)
+      ? round2(synInfo.availableCash)
       : round2(
           sub.totalDeposits
           - totalInvestments
           + derived.totalGrossCollections
-          - derived.totalFees
+          - totalFees
           - sub.totalWithdrawals
         );
-    const cashBalanceSource = (synInfo && synInfo.runningBalance != null)
-      ? 'smartmca_running_balance'
+    const cashBalanceSource = (synInfo && synInfo.availableCash != null)
+      ? 'smartmca_available_cash'
       : 'derived';
 
     // Unreturned Principal = Total Invested - Gross Collections (floored at 0)
@@ -938,13 +956,17 @@ export default async function handler(req, res) {
       ? round2(totalValue / sub.externalCapital)
       : 0;
 
-    // Net Collections = Gross Collections - Total Fees
-    const netCollections = round2(derived.totalGrossCollections - derived.totalFees);
+    // Net Collections = Gross Collections - Total Fees (uses canonical fees)
+    const netCollections = round2(derived.totalGrossCollections - totalFees);
 
     return {
       totalInvestments,
       cashBalance,
       cashBalanceSource,
+      managementFees,
+      residualCommissions,
+      totalFees,
+      feeSource,
       unreturned,
       totalValue,
       netProfit,
@@ -1733,7 +1755,7 @@ export default async function handler(req, res) {
     // When no syndicator is selected, fall back to portfolio-wide aggregates.
     const totalInvested = hasSyndicator ? fin.totalInvestments : (agg.totalInvestedAll || 0);
     const totalGrossCollections = hasSyndicator ? derived.totalGrossCollections : 0;
-    const totalFees = hasSyndicator ? derived.totalFees : 0;
+    const totalFees = hasSyndicator ? fin.totalFees : 0;
 
     const collectionsPctInvested = totalInvested > 0
       ? round2(totalGrossCollections / totalInvested)
@@ -1839,10 +1861,12 @@ export default async function handler(req, res) {
       activeRtrShare: Math.round(activeRtrShare),
       activeUnreturned: Math.round(activeUnreturned),
       pctActiveRtrUnreturned,
-      // Fee Analysis (rows 25-30)
-      managementFees: hasSyndicator ? Math.round(derived.managementFees) : 0,
-      residualCommissions: hasSyndicator ? Math.round(derived.residualCommissions) : 0,
+      // Fee Analysis (rows 25-30) — sourced from fin (canonical from
+      // /syndicators/export breakdown when available, derived as fallback).
+      managementFees: hasSyndicator ? Math.round(fin.managementFees) : 0,
+      residualCommissions: hasSyndicator ? Math.round(fin.residualCommissions) : 0,
       totalFees: Math.round(totalFees),
+      feeSource: hasSyndicator ? fin.feeSource : null,
       feesPctInvested,
       feesPctCollections,
 
@@ -1919,26 +1943,68 @@ export default async function handler(req, res) {
     // 1. Deals — fetch full records (including syndications array per deal)
     const deals = await getAllDeals();
 
-    // 2. Contacts (always fetch for aggregate)
+    // 2. Syndicators (always fetch for aggregate). Uses /syndicators/export
+    //    rather than the legacy /contacts endpoint because export returns the
+    //    canonical `availableCash` + `availableCashBreakdown` that match the
+    //    SmartMCA UI's "Available Cash" figure exactly. Per SmartMCA support:
+    //    the legacy /contacts `details.runningBalance` reflects only
+    //    waterfall-posted distributions and is wrong for any syndicator with
+    //    deposits, withdrawals, or fee netting.
+    //
+    //    Canonical formula (all fields returned by the API):
+    //      availableCash = totalDeposited - totalWithdrawn - totalInvestedLedger
+    //                    - commissionsObligated + cashCollectedGross - managementFees
+    //
+    //    Note: `managementFees` here is ALL-IN fees (upfront feeDeductions +
+    //    per-payment syndicationFee entries). The per-payment vs upfront
+    //    split requires statement parsing (Phase 2).
     let allSyndicators = [];
     try {
-      const cr = await apiFetch('/contacts?limit=100');
-      const contacts = Array.isArray(cr.data)
+      const cr = await apiFetch('/syndicators/export?format=json');
+      const list = Array.isArray(cr.data)
         ? cr.data
         : Array.isArray(cr.data?.data) ? cr.data.data : [];
-      allSyndicators = contacts.filter(c => c.type === 'syndicator').map(c => ({
-        id: c.id,
-        name: c.name,
-        totalInvested: c.details?.totalInvested || 0,
-        runningBalance: c.details?.runningBalance || 0,
-        totalDistributed: c.details?.totalDistributed || 0,
-      }));
+      allSyndicators = list.map(c => {
+        const bd = c.availableCashBreakdown || {};
+        return {
+          id: c.id,
+          name: c.name,
+          type: c.type,
+          // Canonical financials (top-level fields). Note totalInvested is
+          // returned as a string by the API; coerce to number.
+          totalInvested: parseFloat(c.totalInvested) || 0,
+          availableCash: c.availableCash != null ? c.availableCash : 0,
+          // Canonical breakdown components — these compose availableCash.
+          totalDeposited: bd.totalDeposited || 0,
+          totalWithdrawn: bd.totalWithdrawn || 0,
+          totalInvestedLedger: bd.totalInvestedLedger || 0,
+          cashCollectedGross: bd.cashCollectedGross || 0,
+          managementFees: bd.managementFees || 0,            // ALL-IN fees
+          commissionsObligated: bd.commissionsObligated || 0,
+          // Other useful fields
+          dealsFunded: c.dealsFunded || 0,
+          activeDeals: c.activeDeals || 0,
+          totalCashCollected: c.totalCashCollected || 0,    // gross, includes balance transfers
+          // Legacy fields kept ONLY for fallback / backwards compat. Do not
+          // use these for display: they're known to be wrong for many
+          // syndicators. Always prefer availableCash and the breakdown.
+          runningBalance: parseFloat(c.runningBalance) || 0,
+          totalDistributed: parseFloat(c.totalDistributed) || 0,
+        };
+      });
     } catch (e) { /* continue with empty list */ }
 
     const aggregate = {
       totalInvestedAll: allSyndicators.reduce((s, c) => s + c.totalInvested, 0),
-      totalRunningBalanceAll: allSyndicators.reduce((s, c) => s + c.runningBalance, 0),
-      totalDistributedAll: allSyndicators.reduce((s, c) => s + c.totalDistributed, 0),
+      totalAvailableCashAll: allSyndicators.reduce((s, c) => s + c.availableCash, 0),
+      totalDepositedAll: allSyndicators.reduce((s, c) => s + c.totalDeposited, 0),
+      totalWithdrawnAll: allSyndicators.reduce((s, c) => s + c.totalWithdrawn, 0),
+      // Legacy aliases for backwards compatibility with downstream code that
+      // expects these names. Both now point at canonical values:
+      //   totalRunningBalanceAll → availableCash sum (was details.runningBalance)
+      //   totalDistributedAll    → withdrawn sum (was details.totalDistributed = always 0)
+      totalRunningBalanceAll: allSyndicators.reduce((s, c) => s + c.availableCash, 0),
+      totalDistributedAll: allSyndicators.reduce((s, c) => s + c.totalWithdrawn, 0),
       syndicatorCount: allSyndicators.length,
     };
 

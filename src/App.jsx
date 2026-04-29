@@ -356,15 +356,7 @@ function SyndicatorPage({ DATA }) {
             <tr><td colSpan={2} style={hdr}>CAPITAL ACTIVITY</td></tr>
             <tr><td style={lbl}>Total Initial Invested</td><td style={valB}>{fmt(s.externalCapital)}</td></tr>
             <tr><td style={lbl}>Total Reinvested Returns</td><td style={val}>{fmt(s.reinvestedReturns)}</td></tr>
-            <tr>
-              <td style={lbl}>
-                SmartMCA Running Balance
-                <span style={{ fontSize: 11, color: "#A55", fontWeight: "normal", marginLeft: 6 }}>
-                  (system-of-record value; does not currently match SmartMCA UI's "Available")
-                </span>
-              </td>
-              <td style={grn}>{fmt(s.currentCashBalance)}</td>
-            </tr>
+            <tr><td style={lbl}>Available Cash</td><td style={grn}>{fmt(s.currentCashBalance)}</td></tr>
             <tr><td style={lbl}>Net External Capital Returned (Round-Trip)</td><td style={val}>{fmt(s.totalWithdrawals)}</td></tr>
           </tbody>
         </table>
@@ -393,17 +385,16 @@ function SyndicatorPage({ DATA }) {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 }}>
         <table style={tbl}>
           <tbody>
+            <tr><td colSpan={2} style={hdr}>FEE ANALYSIS</td></tr>
             <tr>
-              <td colSpan={2} style={hdr}>
-                FEE ANALYSIS
-                <span style={{ fontSize: 11, color: "#FFD580", fontWeight: "normal", marginLeft: 8, textTransform: "none" }}>
-                  Fees not yet exposed by SmartMCA API — values shown as $0
+              <td style={lbl}>
+                Total Fees Paid
+                <span style={{ fontSize: 11, color: "#666", fontWeight: "normal", marginLeft: 6 }}>
+                  (combined upfront + per-payment; detailed split coming in Phase 2)
                 </span>
               </td>
+              <td style={{ ...valB, color: "#CC0000" }}>{fmt(s.totalFees)}</td>
             </tr>
-            <tr><td style={lbl}>Management Fees (One-Time)</td><td style={val}>{fmt(s.managementFees)}</td></tr>
-            <tr><td style={lbl}>Fee Paid (Per Transaction)</td><td style={val}>{fmt(s.residualCommissions)}</td></tr>
-            <tr><td style={lbl}>Total Fees Paid</td><td style={{ ...valB, color: "#CC0000" }}>{fmt(s.totalFees)}</td></tr>
             <tr><td style={lbl}>Fees as % of Invested</td><td style={val}>{fmt(s.feesPctInvested, "pct")}</td></tr>
             <tr><td style={lbl}>Fees as % of Collections</td><td style={val}>{fmt(s.feesPctCollections, "pct")}</td></tr>
           </tbody>
@@ -412,15 +403,7 @@ function SyndicatorPage({ DATA }) {
         <table style={tbl}>
           <tbody>
             <tr><td colSpan={2} style={hdr}>RETURN METRICS</td></tr>
-            <tr>
-              <td style={lbl}>
-                Net Collections After Fees
-                <span style={{ fontSize: 11, color: "#666", fontWeight: "normal", marginLeft: 6 }}>
-                  (= Gross Collections — fees not yet exposed by API)
-                </span>
-              </td>
-              <td style={valB}>{fmt(s.netCollections)}</td>
-            </tr>
+            <tr><td style={lbl}>Net Collections After Fees</td><td style={valB}>{fmt(s.netCollections)}</td></tr>
             <tr><td style={lbl}>Net Collections as % of Initial Invested</td><td style={val}>{fmt(s.netCollectionsPctExternal, "pct")}</td></tr>
             <tr><td style={lbl}>Unreturned Principal (Still in Deals)</td><td style={val}>{fmt(s.unreturned)}</td></tr>
             <tr><td style={lbl}>Gross P&L (Collections − Capital − Fees)</td><td style={neg}>{fmt(s.grossPnL)}</td></tr>
@@ -433,7 +416,7 @@ function SyndicatorPage({ DATA }) {
         <tbody>
           <tr><td colSpan={2} style={hdr}>TOTAL VALUE CREATED</td></tr>
           <tr><td style={{ ...lbl, paddingLeft: 28 }}>Cash Received (Payouts)</td><td style={val}>{fmt(s.totalWithdrawals)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= Withdrawals</span></td></tr>
-          <tr><td style={{ ...lbl, paddingLeft: 28 }}>+ Current Balance</td><td style={val}>{fmt(s.currentCashBalance)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= SmartMCA Running Balance</span></td></tr>
+          <tr><td style={{ ...lbl, paddingLeft: 28 }}>+ Current Balance</td><td style={val}>{fmt(s.currentCashBalance)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= Available Cash</span></td></tr>
           <tr><td style={{ ...lbl, paddingLeft: 28 }}>+ Outstanding Principal in Deals</td><td style={val}>{fmt(s.unrealizedValue)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= Invested − Collected</span></td></tr>
           <tr><td style={{ ...lbl, fontWeight: 700, color: "#084372" }}>= Total Current Value</td><td style={valB}>{fmt(s.totalCurrentValue)}</td></tr>
           <tr><td style={{ ...lbl, paddingLeft: 28 }}>− External Capital Contributed</td><td style={neg}>{fmt(-s.externalCapital)}</td></tr>
