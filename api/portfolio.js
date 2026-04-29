@@ -1614,6 +1614,13 @@ export default async function handler(req, res) {
     const collectionsPctInvested = totalInvested > 0
       ? round2(totalGrossCollections / totalInvested)
       : 0;
+    // Collections as % of *initial* (external) capital — answers "what
+    // fraction of my original out-of-pocket money have I gotten back?"
+    // This is the more economically meaningful ratio for a syndicator who
+    // reinvests aggressively, since totalInvested grows with reinvestments.
+    const collectionsPctExternal = (hasSyndicator && sub.externalCapital > 0)
+      ? round2(totalGrossCollections / sub.externalCapital)
+      : 0;
     const feesPctInvested = totalInvested > 0
       ? round2(totalFees / totalInvested)
       : 0;
@@ -1657,7 +1664,7 @@ export default async function handler(req, res) {
       balanceTransfersOut: hasSyndicator ? Math.round(derived.balanceTransfersOut) : 0,
       totalGrossCollections: Math.round(totalGrossCollections),
       collectionsPctInvested,
-
+      collectionsPctExternal,
       // Fee Analysis (rows 25-30)
       managementFees: hasSyndicator ? Math.round(derived.managementFees) : 0,
       residualCommissions: hasSyndicator ? Math.round(derived.residualCommissions) : 0,

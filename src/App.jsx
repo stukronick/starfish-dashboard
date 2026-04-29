@@ -323,12 +323,11 @@ function SyndicatorPage({ DATA }) {
         <table style={tbl}>
           <tbody>
             <tr><td colSpan={2} style={hdr}>CAPITAL ACTIVITY</td></tr>
-            <tr><td style={lbl}>Total Deposits (All)</td><td style={valB}>{fmt(s.totalDeposits)}</td></tr>
-            <tr><td style={{ ...lbl, paddingLeft: 28 }}>External Capital Contributed (LMJS)</td><td style={val}>{fmt(s.externalCapital)}</td></tr>
-            <tr><td style={{ ...lbl, paddingLeft: 28 }}>Reinvested Returns & Other</td><td style={val}>{fmt(s.reinvestedReturns)}</td></tr>
+            <tr><td style={lbl}>Total Initial Invested</td><td style={valB}>{fmt(s.externalCapital)}</td></tr>
+            <tr><td style={lbl}>Total Reinvested Returns</td><td style={val}>{fmt(s.reinvestedReturns)}</td></tr>
+            <tr><td style={lbl}>Current Cash Available to Deploy</td><td style={grn}>{fmt(s.currentCashBalance)}</td></tr>
             <tr><td style={lbl}>Total Withdrawals (Payouts)</td><td style={valB}>{fmt(s.totalWithdrawals)}</td></tr>
             <tr><td style={lbl}>Net Capital Still Deployed</td><td style={valB}>{fmt(s.netCapitalDeployed)}</td></tr>
-            <tr><td style={lbl}>Current Cash Balance</td><td style={grn}>{fmt(s.currentCashBalance)}</td></tr>
           </tbody>
         </table>
 
@@ -339,11 +338,16 @@ function SyndicatorPage({ DATA }) {
             <tr><td style={lbl}>Number of Deals</td><td style={val}>{s.numDeals}</td></tr>
             <tr><td style={lbl}>Average Deal Size</td><td style={val}>{fmt(s.avgDealSize)}</td></tr>
             <tr><td style={lbl}>Total Merchant Payments Received</td><td style={val}>{fmt(s.totalMerchantPayments)}</td></tr>
-            <tr><td style={lbl}>Refinance Proceeds Received</td><td style={val}>{fmt(s.refiProceeds)}</td></tr>
-            <tr><td style={lbl}>Balance Transfers In</td><td style={val}>{fmt(s.balanceTransfersIn)}</td></tr>
-            <tr><td style={lbl}>Balance Transfers Out</td><td style={neg}>{fmt(s.balanceTransfersOut)}</td></tr>
-            <tr><td style={lbl}>Total Gross Collections</td><td style={valB}>{fmt(s.totalGrossCollections)}</td></tr>
-            <tr><td style={lbl}>Collections as % of Invested</td><td style={val}>{fmt(s.collectionsPctInvested, "pct")}</td></tr>
+            <tr>
+              <td style={lbl}>
+                Total Gross Collections
+                <span style={{ fontSize: 11, color: "#666", fontWeight: "normal", marginLeft: 6 }}>
+                  (inclusive of Balance Transfers and Refinance Proceeds)
+                </span>
+              </td>
+              <td style={valB}>{fmt(s.totalGrossCollections)}</td>
+            </tr>
+            <tr><td style={lbl}>Collections as % of Initial Invested</td><td style={val}>{fmt(s.collectionsPctExternal, "pct")}</td></tr>
           </tbody>
         </table>
       </div>
