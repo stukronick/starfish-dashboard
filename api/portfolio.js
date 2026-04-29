@@ -1242,13 +1242,115 @@ export default async function handler(req, res) {
     return out;
   }
 
-  function buildFlows(sub, fin, derived, deals, syndicatorId, scenario) {
+  // ============================================================================
+  // HISTORICAL MERCHANT-PAYMENT-LEVEL FLOWS (replaces subledger withdrawals)
+  // ============================================================================
+  // For each per-deal payment record (merchant_payment, refi_incoming,
+  // balance_transfer_in/out), emit a flow scaled to the syndicator's stake
+  // in the deal. Positive flows are net of the per-payment commission so they
+  // reflect what the syndicator actually keeps.
+  //
+  // Data source: derived.perDealShares[i].payments (already fetched in
+  // aggregateSyndicatorMetrics; cached in the same hop).
+  //
+  // Date field: p.transactionDate (matches the curve builder; verified
+  // against staging data).
+  //
+  // Scenario commission rate: same as projected side for internal consistency
+  // (the spreadsheet's 5% baseline). The empirical residual rate for LMJS is
+  // 5.15%; close enough to 5% that the difference is < 1pp on annual XIRR.
+  function buildHistoricalPaymentFlows(perDealShares, scenario) {
+    if (!perDealShares || !Array.isArray(perDealShares)) return [];
+    const COLLECTION_TYPES = new Set(['merchantPayment', 'refinancePayoff', 'balanceTransferIn']);
+    const NEGATIVE_TYPES = new Set(['balanceTransferOut']);
+    const commission = scenario?.commission ?? DEFAULT_SCENARIO.commission;
+
+    const out = [];
+    for (const dealData of perDealShares) {
+      const sharePct = dealData.sharePct;
+      if (!sharePct || sharePct <= 0) continue;
+      const payments = dealData.payments || [];
+      for (const p of payments) {
+        if (p.status !== 'cleared') continue;
+
+        let signedGross;
+        if (COLLECTION_TYPES.has(p.type)) {
+          // refinancePayoff direction='out' is a payoff disbursement, not a collection
+          if (p.type === 'refinancePayoff' && p.direction !== 'in') continue;
+          signedGross = num(p.amount) * sharePct;
+        } else if (NEGATIVE_TYPES.has(p.type)) {
+          signedGross = -num(p.amount) * sharePct;
+        } else {
+          continue;
+        }
+        if (signedGross === 0) continue;
+
+        const date = p.transactionDate ? p.transactionDate.slice(0, 10) : null;
+        if (!date) continue;
+
+        // Apply per-payment commission ONLY to positive flows (the
+        // syndicator pays a fee on each receipt). Negative flows
+        // (balance transfer out) are already a debit; no fee applied.
+        const netAmount = signedGross > 0
+          ? signedGross * (1 - commission)
+          : signedGross;
+
+        out.push({
+          date,
+          amount: round2(netAmount),
+          type: 'Historical Payment',
+          description: `${p.type} (${dealData.dealNo}) net of ${(commission * 100).toFixed(1)}% commission`,
+          dealNo: dealData.dealNo,
+        });
+      }
+    }
+    return out;
+  }
+
+  // ============================================================================
+  // HISTORICAL MANAGEMENT FEES (one-time per deal, on funded date)
+  // ============================================================================
+  // For each deal where the syndicator participated, emit a single negative
+  // flow on the deal's fundedDate equal to (syndicator_funded × managementFeeRate).
+  // Uses the per-syndicator configured rate (8.85% for LMJS, 12% default).
+  //
+  // The spreadsheet shows ~$37,569 total mgmt fees for LMJS, which back-computes
+  // to ~8.85% × $424,365 invested. We mirror that.
+  function buildHistoricalManagementFees(deals, syndicatorId, feeConfig) {
+    if (!deals || !syndicatorId || !feeConfig) return [];
+    const rate = feeConfig.managementFeeRate || 0;
+    if (rate <= 0) return [];
+
+    const out = [];
+    for (const deal of deals) {
+      const synd = extractSyndicationFor(deal, syndicatorId);
+      if (!synd) continue;
+      const syndFunded = num(synd.fundedAmount);
+      if (syndFunded <= 0) continue;
+      const fundedDate = deal.fundedDate ? deal.fundedDate.slice(0, 10) : null;
+      if (!fundedDate) continue;
+
+      const fee = round2(syndFunded * rate);
+      if (fee <= 0) continue;
+
+      out.push({
+        date: fundedDate,
+        amount: -fee,
+        type: 'Management Fee (One-Time)',
+        description: `${(rate * 100).toFixed(2)}% mgmt fee on $${syndFunded.toFixed(0)} (${deal.dealId})`,
+        dealNo: deal.dealId,
+      });
+    }
+    return out;
+  }
+
+  function buildFlows(sub, fin, derived, deals, syndicatorId, scenario, feeConfig) {
     const effectiveScenario = scenario || DEFAULT_SCENARIO;
 
     // ========================================================================
     // BUILD THE XIRR SERIES
     // ========================================================================
-    // Three categories of flow, all on actual dates (no terminal lumps,
+    // Four categories of flow, all on actual dates (no terminal lumps,
     // no aggregation tricks):
     //
     //   1. NEGATIVE — external capital deposits the syndicator made
@@ -1257,16 +1359,18 @@ export default async function handler(req, res) {
     //      excluded — they are internal capital recycling, not new investments.
     //      LMJS today: 3 entries totaling $235k.
     //
-    //   2. POSITIVE — actual withdrawals (paybacks the syndicator received)
-    //      Source: sub.withdrawalEntries. These are gross paybacks (per the
-    //      ledger account being debited). Fees that were assessed are tracked
-    //      separately (#3) so they're not double-subtracted.
+    //   2. NEGATIVE — management fees (one-time per deal, on funded date)
+    //      Source: buildHistoricalManagementFees(). For each deal LMJS
+    //      participated in, subtract LMJS_funded × managementFeeRate (8.85%
+    //      for LMJS) on the deal's fundedDate. Total ≈ $37k for LMJS.
     //
-    //   3. NEGATIVE — fees the syndicator paid
-    //      Source: sub.feeEntries (Management Fee Paid (One Time) +
-    //      Fee Paid (Per Transaction)). Currently $0 from staging API
-    //      (SmartMCA has not populated fee entries yet); will populate
-    //      automatically once upstream is rebuilt.
+    //   3. POSITIVE — historical merchant payments scaled to syndicator share,
+    //      net of per-payment commission
+    //      Source: buildHistoricalPaymentFlows(). One flow per cleared payment
+    //      across all participating deals: payment.amount × syndicator.share ×
+    //      (1 - commission). Replaces the older subledger-withdrawal approach
+    //      which was less granular (distributions came in batches, after
+    //      processing delays, and were already net of fees we couldn't see).
     //
     //   4. POSITIVE — projected future per-deal payments (commission-net)
     //      Source: buildProjectedFlows(). Per active deal, projects forward
@@ -1290,25 +1394,16 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2. Actual withdrawals (positive)
-    for (const w of sub.withdrawalEntries) {
-      xirrFlows.push({
-        date: w.date,
-        amount: w.amount,
-        type: 'Withdrawal',
-        description: 'Syndicator payout',
-      });
+    // 2. Historical management fees (negative, one per deal on funded date)
+    const mgmtFeeFlows = buildHistoricalManagementFees(deals, syndicatorId, feeConfig);
+    for (const f of mgmtFeeFlows) {
+      xirrFlows.push(f);
     }
 
-    // 3. Fees paid (negative). Empty on staging today; populated when the
-    // upstream subledger has fee entries.
-    for (const f of sub.feeEntries) {
-      xirrFlows.push({
-        date: f.date,
-        amount: -f.amount,
-        type: f.type,
-        description: f.type,
-      });
+    // 3. Historical merchant payments × share, net of commission (positive)
+    const paymentFlows = buildHistoricalPaymentFlows(derived?.perDealShares, effectiveScenario);
+    for (const p of paymentFlows) {
+      xirrFlows.push(p);
     }
 
     // 4. Projected future payments (positive)
@@ -1362,16 +1457,16 @@ export default async function handler(req, res) {
       xirrComposition: {
         externalDepositCount: sub.externalDeposits.length,
         externalDepositTotal: round2(sub.externalDeposits.reduce((s, d) => s + d.amount, 0)),
-        withdrawalCount: sub.withdrawalEntries.length,
-        withdrawalTotal: round2(sub.withdrawalEntries.reduce((s, w) => s + w.amount, 0)),
-        feeCount: sub.feeEntries.length,
-        feeTotal: round2(sub.feeEntries.reduce((s, f) => s + f.amount, 0)),
+        mgmtFeeCount: mgmtFeeFlows.length,
+        mgmtFeeTotal: round2(mgmtFeeFlows.reduce((s, f) => s - f.amount, 0)),  // store as positive
+        historicalPaymentCount: paymentFlows.length,
+        historicalPaymentTotal: round2(paymentFlows.reduce((s, p) => s + p.amount, 0)),
         projectedCount: projectedFlows.length,
         projectedTotal: round2(projectedFlows.reduce((s, f) => s + f.amount, 0)),
         netExpected: round2(
           -sub.externalDeposits.reduce((s, d) => s + d.amount, 0)
-          + sub.withdrawalEntries.reduce((s, w) => s + w.amount, 0)
-          - sub.feeEntries.reduce((s, f) => s + f.amount, 0)
+          + mgmtFeeFlows.reduce((s, f) => s + f.amount, 0)        // negative values, so this is a subtraction
+          + paymentFlows.reduce((s, p) => s + p.amount, 0)
           + projectedFlows.reduce((s, f) => s + f.amount, 0)
         ),
       },
@@ -1865,7 +1960,7 @@ export default async function handler(req, res) {
 
       derived = await aggregateSyndicatorMetrics(deals, syndicatorId, feeConfig, sub, fetchPayments);
       fin = combineFinancials(sub, derived, synInfo);
-      flows = buildFlows(sub, fin, derived, deals, syndicatorId);
+      flows = buildFlows(sub, fin, derived, deals, syndicatorId, undefined, feeConfig);
     }
 
     // 4. Build the deal-perf table. When a syndicator is selected, each row
