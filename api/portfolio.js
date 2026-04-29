@@ -1020,7 +1020,206 @@ export default async function handler(req, res) {
     return null;
   }
 
-  function buildFlows(sub, fin, derived) {
+  // ============================================================================
+  // PROJECTED CASH FLOW ENGINE
+  // ============================================================================
+  // Generates synthetic future payment streams for each active deal, scaled to
+  // the syndicator's stake and adjusted for scenario assumptions. Combined
+  // with historical deposits/withdrawals, this feeds the Projected XIRR.
+  //
+  // Mirrors the spreadsheet's "Projected Cash Flows" tab approach but derives
+  // the inputs (payment_amount, frequency, payments_remaining) from observed
+  // data rather than reading them from explicit deal-record fields. The
+  // SmartMCA API does not expose `dailyCollectionAmount` / `weeklyCollectionAmount`
+  // / `remainingPayments` directly, so we derive them from history.
+  //
+  // Default scenario mirrors the spreadsheet's base case:
+  //   commission     = 5%   (per-payment residual to the funder, deducted from each projected positive)
+  //   haircut        = 0%   (additional reduction for slow-pay/short-pay risk)
+  //   recoveryRate   = 0%   (defaulted deals contribute nothing in the baseline)
+  //   recoveryMonths = 6    (when recoveryRate > 0, recovery arrives this many months after last payment)
+  //   addlDefaultRate= 0%   (currently unused; reserved for vintage-level active-default modeling)
+
+  const DEFAULT_SCENARIO = Object.freeze({
+    commission: 0.05,
+    haircut: 0.00,
+    recoveryRate: 0.00,
+    recoveryMonths: 6,
+    addlDefaultRate: 0.00,
+  });
+
+  // Heuristic frequency classification. Spec calls for explicit
+  // DAILY_COLLECTION_AMOUNT / WEEKLY_COLLECTION_AMOUNT fields; SmartMCA API
+  // doesn't have these. Derive from the payment cadence we've observed:
+  //   < 4 days/payment → Daily
+  //   ≥ 4 days/payment → Weekly
+  // Edge cases (no payments yet, or one payment) → default to Daily, the
+  // dominant frequency in the LMJS portfolio.
+  function classifyFrequency(deal) {
+    const baseVars = deal?.computedVariables?.baseVariables || {};
+    const txCount = num(baseVars.txPaymentCount);
+    const daysSinceFunded = num(baseVars.daysSinceFunded);
+    if (txCount < 2 || daysSinceFunded < 1) return 'daily';
+    const cadence = daysSinceFunded / txCount;
+    return cadence < 4 ? 'daily' : 'weekly';
+  }
+
+  // Per-payment dollar amount, derived from history. = totalCollected / txPaymentCount.
+  // Returns 0 if either input is missing/zero (caller should skip projection
+  // for the deal in that case).
+  function derivePaymentAmount(deal) {
+    const baseVars = deal?.computedVariables?.baseVariables || {};
+    const txCount = num(baseVars.txPaymentCount);
+    const totalCollected = num(baseVars.totalCollected || deal.totalCollected);
+    if (txCount <= 0 || totalCollected <= 0) return 0;
+    return totalCollected / txCount;
+  }
+
+  // Returns the most reliable "last payment date" we have on the deal, as a
+  // Date object. Prefers computedVariables.baseVariables.txLastPaymentDate
+  // (populated even when top-level lastPaymentDate is null).
+  function getLastPaymentDate(deal) {
+    const tx = deal?.computedVariables?.baseVariables?.txLastPaymentDate;
+    if (tx) return new Date(tx);
+    if (deal?.lastPaymentDate) return new Date(deal.lastPaymentDate);
+    return null;
+  }
+
+  // Increment a date by one business day (Mon-Fri). Skips Sat/Sun. This isn't
+  // a full holiday calendar but matches the "skip" bankHolidayHandling we see
+  // on the SmartMCA funder record, close enough for projection purposes.
+  function addBusinessDay(date) {
+    const d = new Date(date);
+    d.setDate(d.getDate() + 1);
+    while (d.getDay() === 0 || d.getDay() === 6) {
+      d.setDate(d.getDate() + 1);
+    }
+    return d;
+  }
+
+  // Generate the per-deal projected payment stream for an ACTIVE deal,
+  // scaled to the syndicator's slice and adjusted for commission + haircut.
+  //
+  // Returns array of {date, amount, type, description, dealNo}. Empty array
+  // if the deal is not eligible for projection (closed, refinanced, defaulted,
+  // or zero outstanding).
+  function generateProjectedPayments(deal, sharePct, scenario) {
+    if (!deal) return [];
+    if (deal.status !== 'active') return [];
+
+    const outstanding = num(deal.outstandingBalance);
+    if (outstanding <= 0) return [];
+
+    const paymentAmount = derivePaymentAmount(deal);
+    if (paymentAmount <= 0) return [];
+
+    // Syndicator's share of each merchant payment
+    const sharePerPayment = paymentAmount * sharePct;
+    if (sharePerPayment <= 0) return [];
+
+    // Net of scenario adjustments (commission + haircut)
+    const netPerPayment = sharePerPayment * (1 - scenario.commission) * (1 - scenario.haircut);
+    if (netPerPayment <= 0) return [];
+
+    // Walk forward from last observed payment date (or today if missing)
+    const last = getLastPaymentDate(deal) || new Date();
+    const frequency = classifyFrequency(deal);
+
+    // How many payments to project? = remaining_outstanding / paymentAmount.
+    // Ceil to make sure we cover the full balance; the last payment may be
+    // partial (residual). Cap at a sane upper bound so a tiny paymentAmount
+    // doesn't produce 100k flows.
+    const fullPayments = Math.floor(outstanding / paymentAmount);
+    const residualGross = outstanding - fullPayments * paymentAmount;
+    const totalPayments = fullPayments + (residualGross > 0.01 ? 1 : 0);
+
+    const MAX_PROJECTED_PER_DEAL = 500;
+    const numPayments = Math.min(totalPayments, MAX_PROJECTED_PER_DEAL);
+
+    const flows = [];
+    let cursor = new Date(last);
+    for (let i = 0; i < numPayments; i++) {
+      // Advance to next payment date
+      if (frequency === 'daily') {
+        cursor = addBusinessDay(cursor);
+      } else {
+        cursor = new Date(cursor);
+        cursor.setDate(cursor.getDate() + 7);
+      }
+
+      // Last payment may be a partial residual
+      const isLast = (i === numPayments - 1) && residualGross > 0.01;
+      const grossThisPayment = isLast ? residualGross : paymentAmount;
+      const netThisPayment = grossThisPayment * sharePct
+                             * (1 - scenario.commission)
+                             * (1 - scenario.haircut);
+
+      flows.push({
+        date: cursor.toISOString().slice(0, 10),
+        amount: round2(netThisPayment),
+        type: 'Projected Payment',
+        description: `Projected ${frequency} payment (${deal.dealId})`,
+        dealNo: deal.dealId,
+      });
+    }
+
+    return flows;
+  }
+
+  // Generate a single projected default-recovery flow for a DEFAULTED deal.
+  // Returns null if the deal isn't eligible (not defaulted, zero outstanding,
+  // or recoveryRate is 0).
+  function generateDefaultRecovery(deal, sharePct, scenario) {
+    if (!deal || deal.status !== 'defaulted') return null;
+    if (scenario.recoveryRate <= 0) return null;
+
+    const outstanding = num(deal.outstandingBalance);
+    if (outstanding <= 0) return null;
+
+    const recoveryAmount = outstanding * sharePct * scenario.recoveryRate;
+    if (recoveryAmount <= 0) return null;
+
+    // Recovery date = last payment date + recoveryMonths × 30 days. If we
+    // have no last payment date (defaulted before paying anything?), use
+    // funded date + recoveryMonths.
+    const anchor = getLastPaymentDate(deal) || (deal.fundedDate ? new Date(deal.fundedDate) : new Date());
+    const recoveryDate = new Date(anchor);
+    recoveryDate.setDate(recoveryDate.getDate() + scenario.recoveryMonths * 30);
+
+    return {
+      date: recoveryDate.toISOString().slice(0, 10),
+      amount: round2(recoveryAmount),
+      type: 'Projected Recovery',
+      description: `Projected default recovery (${deal.dealId})`,
+      dealNo: deal.dealId,
+    };
+  }
+
+  // Orchestrator: walk all deals, generate projected flows for the syndicator's
+  // slice, return flat sorted array. `deals` is the full deal list (with
+  // computedVariables, etc.); `syndicatorId` filters to only those deals where
+  // this syndicator participates.
+  function buildProjectedFlows(deals, syndicatorId, scenario = DEFAULT_SCENARIO) {
+    if (!deals || !syndicatorId) return [];
+    const out = [];
+    for (const deal of deals) {
+      const synd = extractSyndicationFor(deal, syndicatorId);
+      if (!synd) continue;
+      const sharePct = num(synd.investmentPercentage) / 100;
+      if (sharePct <= 0) continue;
+
+      const projected = generateProjectedPayments(deal, sharePct, scenario);
+      out.push(...projected);
+
+      const recovery = generateDefaultRecovery(deal, sharePct, scenario);
+      if (recovery) out.push(recovery);
+    }
+    out.sort((a, b) => a.date.localeCompare(b.date));
+    return out;
+  }
+
+  function buildFlows(sub, fin, derived, deals, syndicatorId, scenario) {
+    const effectiveScenario = scenario || DEFAULT_SCENARIO;
     const xirrFlows = [];
     for (const date of Object.keys(sub.flowsByDate).sort()) {
       const amt = round2(sub.flowsByDate[date]);
@@ -1032,23 +1231,34 @@ export default async function handler(req, res) {
         description: amt < 0 ? 'Syndicator Deposit' : 'Syndicator Payout',
       });
     }
-    if (fin.cashBalance > 0) {
-      xirrFlows.push({
-        date: new Date().toISOString().slice(0, 10),
-        amount: round2(fin.cashBalance),
-        type: 'Current Balance',
-        description: 'Cash on hand (available now)',
-      });
-    }
+
+    // INTENTIONALLY DO NOT add fin.cashBalance as a terminal positive flow.
+    //
+    // The subledger already contains every deposit (negative) and every
+    // withdrawal (positive) as separate flow rows. The "cash balance" is a
+    // derived snapshot: deposits − investments + collections − fees − withdrawals.
+    // It's leftover undeployed capital sitting in the syndicator's account
+    // waiting to be invested in another deal. It is NOT a return.
+    //
+    // Adding it as a positive terminal flow would double-count: you'd be
+    // implying the syndicator "received" that cash today, when in reality
+    // they merely have not yet redeployed prior receipts. This was the cause
+    // of the previously broken xirrTotalLoss = 0 calculation.
+    //
+    // The spreadsheet (Returns Summary E40, "Realized XIRR") DOES include
+    // it as a terminal flow — that's a "what would my IRR be if I closed
+    // the position today" framing. We deliberately diverge from that here
+    // because for an open syndicator account, treating idle cash as recovery
+    // overstates realized returns. Idle cash earns 0% until redeployed.
 
     // Compute the three XIRR scenarios.
     // Total-loss case: just the historical flows (assumes outstanding = 0)
     const xirrTotalLoss = computeXirr(xirrFlows);
 
-    // Full-recovery case: append outstanding principal as a positive flow today.
-    // For syndicator view, outstanding = fin.unreturned (their slice of unreturned
-    // principal). For portfolio view, fin may not have unreturned, so we fall
-    // back to deal-level outstanding.
+    // Full-recovery case: append outstanding principal as a positive flow
+    // today. This represents the optimistic "all active deals pay out their
+    // remaining outstanding" assumption. Idle cash on hand is excluded for
+    // the same reason as above — it isn't return, it's pending capital.
     const todayStr = new Date().toISOString().slice(0, 10);
     const outstanding = round2(fin.unreturned || 0);
     let xirrFullRecovery = null;
@@ -1068,9 +1278,26 @@ export default async function handler(req, res) {
       xirrFullRecovery = xirrTotalLoss;
     }
 
-    // Projected XIRR: optimistic case (same as full recovery for now).
-    // The "total loss" floor lets users bracket the realistic range themselves.
-    const projectedXIRR = xirrFullRecovery;
+    // Projected XIRR: realistic case. Combines historical deposits/withdrawals
+    // with synthetic future payments generated per active deal (scaled to the
+    // syndicator's investment percentage, net of commission and haircut), plus
+    // any default-recovery flows from currently-defaulted deals.
+    //
+    // This is the spreadsheet's "Projected Cash Flows" engine equivalent.
+    // Numbers won't match exactly because (a) our "today" differs from the
+    // spreadsheet's reporting date, (b) we derive paymentAmount/frequency
+    // from observed history rather than reading them from explicit fields,
+    // and (c) our daily/weekly classification is heuristic. Should land
+    // within ±20pp of the spreadsheet's projected XIRR for the same data.
+    const projectedFlows = buildProjectedFlows(deals, syndicatorId, effectiveScenario);
+    let projectedXIRR;
+    if (projectedFlows.length === 0) {
+      // No active deals to project from → fall back to the lump-sum recovery
+      // assumption. This happens for portfolios with all-closed deals.
+      projectedXIRR = xirrFullRecovery;
+    } else {
+      projectedXIRR = computeXirr([...xirrFlows, ...projectedFlows]);
+    }
 
     // Cash Flow Chart — note: collection/fee events are not visible per-day
     // until the upstream subledger is rebuilt. Chart shows deposits,
@@ -1094,6 +1321,16 @@ export default async function handler(req, res) {
       projectedXIRR,
       xirrFullRecovery,
       xirrTotalLoss,
+      // For _debug surfacing — lets the dashboard show what shape the
+      // projection actually has (number of synthetic flows generated, sum of
+      // their amounts, date range covered).
+      projectedFlowsMeta: {
+        count: projectedFlows.length,
+        totalAmount: round2(projectedFlows.reduce((s, f) => s + f.amount, 0)),
+        firstDate: projectedFlows.length > 0 ? projectedFlows[0].date : null,
+        lastDate: projectedFlows.length > 0 ? projectedFlows[projectedFlows.length - 1].date : null,
+        scenario: effectiveScenario,
+      },
     };
   }
 
@@ -1526,7 +1763,7 @@ export default async function handler(req, res) {
 
       derived = await aggregateSyndicatorMetrics(deals, syndicatorId, feeConfig, sub, fetchPayments);
       fin = combineFinancials(sub, derived, synInfo);
-      flows = buildFlows(sub, fin);
+      flows = buildFlows(sub, fin, derived, deals, syndicatorId);
     }
 
     // 4. Build the deal-perf table. When a syndicator is selected, each row
@@ -1646,6 +1883,7 @@ export default async function handler(req, res) {
           residualCount: sub.residualCount,
           hasLedgerFees: sub.hasLedgerFees,
         } : null,
+        projectedFlows: flows.projectedFlowsMeta || null,
         derived: derived ? {
           dealsParticipated: derived.dealsParticipated,
           syndInvested: derived.syndInvested,
