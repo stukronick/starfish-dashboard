@@ -1629,24 +1629,42 @@ export default async function handler(req, res) {
       ? round2(fin.netCollections / sub.externalCapital)
       : 0;
 
-    // Active RTR Share: sum of LMJS's RTR slice across deals that still have
-    // outstanding to recover (dollarRemaining is a positive number — Profit
-    // deals are 'Paid Off', Default deals can be 0). This is the right
-    // denominator for forward-looking ratios because it focuses on the
-    // deals where money is still expected to flow, excluding old completed
-    // deals that would dilute the metric.
-    const activeRtrShare = hasSyndicator
-      ? perfs.reduce((sum, d) => {
-          const remaining = typeof d.dollarRemaining === 'number' ? d.dollarRemaining : 0;
-          if (remaining <= 0) return sum;
-          return sum + (d.rtr * d.syndPct);
-        }, 0)
-      : 0;
+    // Active-deal scope: deals that are still actively collecting (status='Active').
+    // Excludes Profit deals (paid off) AND Default deals (no longer expected to
+    // recover). Both numerator and denominator below use this same scope so the
+    // ratio is internally consistent — defaulted deals' RTR is not "expected
+    // money" and their unreturned principal is effectively a write-off, not
+    // pending recovery.
+    //
+    // For each Active deal, LMJS's slice:
+    //   syndRtr        = deal.rtr × syndPct          (their share of the deal's RTR)
+    //   syndCollected  = approximated as syndRtr × (1 - dollarRemaining/(rtr*syndPct))
+    //                    — but since we already have syndOutstanding directly,
+    //                      LMJS's already-collected on that deal = syndRtr - dollarRemaining
+    //   syndUnreturned = max(0, syndInvested - syndCollected)
+    //                    where syndInvested = deal.invested (LMJS's funded amount)
+    //
+    // Simpler equivalent: LMJS's unreturned for an active deal is bounded by
+    // their invested ÷ collected on that deal. We use d.invested and d.collected
+    // directly from mapDeal for the active subset.
+    let activeRtrShare = 0;
+    let activeUnreturned = 0;
+    if (hasSyndicator) {
+      for (const d of perfs) {
+        if (d.status !== 'Active') continue; // exclude Profit and Default
+        activeRtrShare += d.rtr * d.syndPct;
+        // d.invested and d.collected are LMJS's slice (mapDeal sets them when
+        // syndication is provided). Floor at 0 to avoid negatives from deals
+        // that have collected more than invested but aren't yet flagged Profit.
+        activeUnreturned += Math.max(0, d.invested - d.collected);
+      }
+    }
     // Unreturned principal as a % of Active RTR — answers "of the money I'm
     // still expecting from active deals, what fraction is just principal
-    // recovery vs. profit?" Higher = closer to break-even on those deals.
+    // recovery vs. profit?" Both sides scoped to Active deals only (excludes
+    // paid-off and defaulted deals). Higher = closer to break-even.
     const pctActiveRtrUnreturned = (hasSyndicator && activeRtrShare > 0)
-      ? round2(fin.unreturned / activeRtrShare)
+      ? round2(activeUnreturned / activeRtrShare)
       : 0;
     const feesPctInvested = totalInvested > 0
       ? round2(totalFees / totalInvested)
@@ -1694,6 +1712,7 @@ export default async function handler(req, res) {
       collectionsPctExternal,
       netCollectionsPctExternal,
       activeRtrShare: Math.round(activeRtrShare),
+      activeUnreturned: Math.round(activeUnreturned),
       pctActiveRtrUnreturned,
       // Fee Analysis (rows 25-30)
       managementFees: hasSyndicator ? Math.round(derived.managementFees) : 0,
