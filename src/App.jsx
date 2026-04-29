@@ -90,8 +90,7 @@ function OverviewPage({ DATA }) {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginBottom: 32 }}>
         <KpiCard label="Total Invested" value={fmt(s.totalInvested)} sub={`${s.numDeals} deals · avg ${fmt(s.avgDealSize)}`} />
         <KpiCard label="Net Profit (Total Value)" value={fmt(s.netProfit)} accent={clr(s.netProfit)} sub={`Cash-on-Cash ${fmt(s.cashOnCashMultiple, "multiple")}`} />
-        <KpiCard label="Projected XIRR" value={fmt(s.projectedXIRR, "xirr")} accent="#FD8E3A" sub={`If total loss: ${fmt(s.xirrTotalLoss, "xirr")}`} />
-      </div>
+        <KpiCard label="Projected XIRR" value={fmt(s.projectedXIRR, "xirr")} accent="#FD8E3A" />      </div>
 
       {/* Portfolio Summary */}
       <div style={{ background: "#ffffff", borderRadius: 12, padding: 24, border: "1px solid #DFF0FF", boxShadow: "0 1px 4px rgba(8,67,114,0.06)", marginBottom: 32 }}>
@@ -411,9 +410,6 @@ function SyndicatorPage({ DATA }) {
             <tr><td style={lbl}></td><td style={val}></td></tr>
             <tr><td style={lbl}>Unrealized Value (Outstanding Principal)</td><td style={valB}>{fmt(s.unrealizedValue)}</td></tr>
             <tr><td style={lbl}>% of Total Invested Still Outstanding</td><td style={val}>{fmt(s.pctStillOutstanding, "pct")}</td></tr>
-            <tr><td style={lbl}></td><td style={val}></td></tr>
-            <tr><td style={{ ...lbl, fontSize: 12 }}>⚠ IF outstanding fully recovered → XIRR</td><td style={grn}>{fmt(s.xirrFullRecovery, "xirr")}</td></tr>
-            <tr><td style={{ ...lbl, fontSize: 12 }}>⚠ IF outstanding is total loss → XIRR</td><td style={{ ...val, color: "#CC0000", fontWeight: 700 }}>{fmt(s.xirrTotalLoss, "xirr")}</td></tr>
           </tbody>
         </table>
       </div>

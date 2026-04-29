@@ -572,6 +572,13 @@ export default async function handler(req, res) {
     const flowsByDate = {}; // for XIRR
     const dailyFlows = {};  // for cash flow chart
 
+    // NEW: keep per-entry external deposits AND withdrawals so XIRR can use
+    // them with their actual dates. Previously we aggregated everything
+    // into flowsByDate which mixed external-capital deposits and
+    // reinvestment deposits together.
+    const externalDeposits = []; // [{ date, amount }] — only EXTERNAL capital
+    const withdrawalEntries = []; // [{ date, amount }] — actual paybacks to syndicator
+
     for (const e of ledger) {
       const desc = (e.description || '').toLowerCase();
       const date = (e.date || '').slice(0, 10);
@@ -588,9 +595,9 @@ export default async function handler(req, res) {
         } else if (desc.includes('refund')) {
           feeRefunds += credit;
         } else {
+          // EXTERNAL capital deposit — track date+amount for IRR
           externalCapital += credit;
-          // BUG #4 FIX: period.start = earliest external-capital deposit
-          // (matches spreadsheet's 8/22/2025 derivation, not earliest deal date)
+          externalDeposits.push({ date, amount: round2(credit) });
           if (!earliestDepositDate || date < earliestDepositDate) {
             earliestDepositDate = date;
           }
@@ -600,6 +607,7 @@ export default async function handler(req, res) {
 
       } else if (desc.includes('syndicator withdrawal:')) {
         totalWithdrawals += debit;
+        withdrawalEntries.push({ date, amount: round2(debit) });
         dailyFlows[date].withdrawals += debit;
         flowsByDate[date] = (flowsByDate[date] || 0) + debit;  // positive = cash out
 
@@ -632,9 +640,16 @@ export default async function handler(req, res) {
     let mgmtFeeCount = 0;
     let residualCount = 0; // misnomer: actually all per-transaction fee row count
 
+    // NEW: capture per-entry fee data with dates so XIRR can include them as
+    // negative flows (LMJS pays fees → reduces their economic return).
+    // Empty on staging today (SmartMCA returns 0 fee entries) but ready for
+    // when the upstream subledger is rebuilt.
+    const feeEntries = []; // [{ date, amount, type }]
+
     for (const e of entries) {
       const desc = (e.description || '');
       const txType = e.transactionType || e.type || '';
+      const date = (e.date || '').slice(0, 10);
       const amt = (e.debit || 0) + (e.credit || 0); // fees are usually debits, but be tolerant
 
       // One-time management fee — tagged by transaction type. The fallback
@@ -644,6 +659,7 @@ export default async function handler(req, res) {
           /upfront\s+sales\s+commission/i.test(desc)) {
         mgmtFeesLedger += amt;
         mgmtFeeCount++;
+        if (date && amt > 0) feeEntries.push({ date, amount: round2(amt), type: 'Management Fee' });
         continue;
       }
 
@@ -653,6 +669,7 @@ export default async function handler(req, res) {
       if (txType === 'Fee Paid (Per Transaction)') {
         residualCommissionsLedger += amt;
         residualCount++;
+        if (date && amt > 0) feeEntries.push({ date, amount: round2(amt), type: 'Per-Transaction Fee' });
       }
     }
 
@@ -677,6 +694,13 @@ export default async function handler(req, res) {
       earliestDepositDate,
       flowsByDate,
       dailyFlows,
+      // NEW: per-entry detail used by buildFlows to construct the cleaner
+      // single-XIRR series. externalDeposits and withdrawalEntries replace
+      // the previous flowsByDate aggregation for IRR purposes (flowsByDate
+      // is kept for the cash flow chart, which still wants daily aggregation).
+      externalDeposits,
+      withdrawalEntries,
+      feeEntries,
       entryCount: ledger.length,
       totalEntryCount: entries.length,
     };
@@ -1220,84 +1244,84 @@ export default async function handler(req, res) {
 
   function buildFlows(sub, fin, derived, deals, syndicatorId, scenario) {
     const effectiveScenario = scenario || DEFAULT_SCENARIO;
+
+    // ========================================================================
+    // BUILD THE XIRR SERIES
+    // ========================================================================
+    // Three categories of flow, all on actual dates (no terminal lumps,
+    // no aggregation tricks):
+    //
+    //   1. NEGATIVE — external capital deposits the syndicator made
+    //      Source: sub.externalDeposits (deposits flagged as new capital, not
+    //      reinvestments of prior payouts). Reinvestments are intentionally
+    //      excluded — they are internal capital recycling, not new investments.
+    //      LMJS today: 3 entries totaling $235k.
+    //
+    //   2. POSITIVE — actual withdrawals (paybacks the syndicator received)
+    //      Source: sub.withdrawalEntries. These are gross paybacks (per the
+    //      ledger account being debited). Fees that were assessed are tracked
+    //      separately (#3) so they're not double-subtracted.
+    //
+    //   3. NEGATIVE — fees the syndicator paid
+    //      Source: sub.feeEntries (Management Fee Paid (One Time) +
+    //      Fee Paid (Per Transaction)). Currently $0 from staging API
+    //      (SmartMCA has not populated fee entries yet); will populate
+    //      automatically once upstream is rebuilt.
+    //
+    //   4. POSITIVE — projected future per-deal payments (commission-net)
+    //      Source: buildProjectedFlows(). Per active deal, projects forward
+    //      payment schedule from txLastPaymentDate using observed cadence,
+    //      scaled to syndicator share, net of 5% per-payment commission.
+    //
+    // We do NOT add cash-on-hand as a terminal flow — idle cash isn't return.
+    // We do NOT add a lump-sum recovery — projected per-deal payments
+    // produce the recovery of outstanding implicitly, on the dates payments
+    // would actually arrive.
+
     const xirrFlows = [];
-    for (const date of Object.keys(sub.flowsByDate).sort()) {
-      const amt = round2(sub.flowsByDate[date]);
-      if (amt === 0) continue;
+
+    // 1. External capital deposits (negative)
+    for (const d of sub.externalDeposits) {
       xirrFlows.push({
-        date,
-        amount: amt,
-        type: amt < 0 ? 'Deposit' : 'Withdrawal',
-        description: amt < 0 ? 'Syndicator Deposit' : 'Syndicator Payout',
+        date: d.date,
+        amount: -d.amount,
+        type: 'External Capital',
+        description: 'Syndicator external capital deposit',
       });
     }
 
-    // INTENTIONALLY DO NOT add fin.cashBalance as a terminal positive flow.
-    //
-    // The subledger already contains every deposit (negative) and every
-    // withdrawal (positive) as separate flow rows. The "cash balance" is a
-    // derived snapshot: deposits − investments + collections − fees − withdrawals.
-    // It's leftover undeployed capital sitting in the syndicator's account
-    // waiting to be invested in another deal. It is NOT a return.
-    //
-    // Adding it as a positive terminal flow would double-count: you'd be
-    // implying the syndicator "received" that cash today, when in reality
-    // they merely have not yet redeployed prior receipts. This was the cause
-    // of the previously broken xirrTotalLoss = 0 calculation.
-    //
-    // The spreadsheet (Returns Summary E40, "Realized XIRR") DOES include
-    // it as a terminal flow — that's a "what would my IRR be if I closed
-    // the position today" framing. We deliberately diverge from that here
-    // because for an open syndicator account, treating idle cash as recovery
-    // overstates realized returns. Idle cash earns 0% until redeployed.
-
-    // Compute the three XIRR scenarios.
-    // Total-loss case: just the historical flows (assumes outstanding = 0)
-    const xirrTotalLoss = computeXirr(xirrFlows);
-
-    // Full-recovery case: append outstanding principal as a positive flow
-    // today. This represents the optimistic "all active deals pay out their
-    // remaining outstanding" assumption. Idle cash on hand is excluded for
-    // the same reason as above — it isn't return, it's pending capital.
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const outstanding = round2(fin.unreturned || 0);
-    let xirrFullRecovery = null;
-    if (outstanding > 0) {
-      const flowsWithRecovery = [
-        ...xirrFlows,
-        {
-          date: todayStr,
-          amount: outstanding,
-          type: 'Projected Recovery',
-          description: 'Outstanding principal assumed recovered',
-        },
-      ];
-      xirrFullRecovery = computeXirr(flowsWithRecovery);
-    } else {
-      // No outstanding → full recovery is the same as total loss
-      xirrFullRecovery = xirrTotalLoss;
+    // 2. Actual withdrawals (positive)
+    for (const w of sub.withdrawalEntries) {
+      xirrFlows.push({
+        date: w.date,
+        amount: w.amount,
+        type: 'Withdrawal',
+        description: 'Syndicator payout',
+      });
     }
 
-    // Projected XIRR: realistic case. Combines historical deposits/withdrawals
-    // with synthetic future payments generated per active deal (scaled to the
-    // syndicator's investment percentage, net of commission and haircut), plus
-    // any default-recovery flows from currently-defaulted deals.
-    //
-    // This is the spreadsheet's "Projected Cash Flows" engine equivalent.
-    // Numbers won't match exactly because (a) our "today" differs from the
-    // spreadsheet's reporting date, (b) we derive paymentAmount/frequency
-    // from observed history rather than reading them from explicit fields,
-    // and (c) our daily/weekly classification is heuristic. Should land
-    // within ±20pp of the spreadsheet's projected XIRR for the same data.
+    // 3. Fees paid (negative). Empty on staging today; populated when the
+    // upstream subledger has fee entries.
+    for (const f of sub.feeEntries) {
+      xirrFlows.push({
+        date: f.date,
+        amount: -f.amount,
+        type: f.type,
+        description: f.type,
+      });
+    }
+
+    // 4. Projected future payments (positive)
     const projectedFlows = buildProjectedFlows(deals, syndicatorId, effectiveScenario);
-    let projectedXIRR;
-    if (projectedFlows.length === 0) {
-      // No active deals to project from → fall back to the lump-sum recovery
-      // assumption. This happens for portfolios with all-closed deals.
-      projectedXIRR = xirrFullRecovery;
-    } else {
-      projectedXIRR = computeXirr([...xirrFlows, ...projectedFlows]);
+    for (const p of projectedFlows) {
+      xirrFlows.push(p);
     }
+
+    // Sort everything by date
+    xirrFlows.sort((a, b) => a.date.localeCompare(b.date));
+
+    // Compute the single XIRR
+    const projectedXIRR = computeXirr(xirrFlows);
 
     // Cash Flow Chart — note: collection/fee events are not visible per-day
     // until the upstream subledger is rebuilt. Chart shows deposits,
@@ -1319,17 +1343,37 @@ export default async function handler(req, res) {
       xirrFlows,
       cashFlowChart,
       projectedXIRR,
-      xirrFullRecovery,
-      xirrTotalLoss,
-      // For _debug surfacing — lets the dashboard show what shape the
-      // projection actually has (number of synthetic flows generated, sum of
-      // their amounts, date range covered).
+      // Removed: xirrTotalLoss and xirrFullRecovery. The single Projected XIRR
+      // captures the full picture (external in + actual paybacks - fees +
+      // projected forward). Frontend should display only projectedXIRR.
+      xirrTotalLoss: null,
+      xirrFullRecovery: null,
+      // _debug surfacing — lets the dashboard show what shape the projection
+      // actually has (number of synthetic flows generated, sum of their
+      // amounts, date range covered).
       projectedFlowsMeta: {
         count: projectedFlows.length,
         totalAmount: round2(projectedFlows.reduce((s, f) => s + f.amount, 0)),
         firstDate: projectedFlows.length > 0 ? projectedFlows[0].date : null,
         lastDate: projectedFlows.length > 0 ? projectedFlows[projectedFlows.length - 1].date : null,
         scenario: effectiveScenario,
+      },
+      // Composition of the XIRR series, for verification:
+      xirrComposition: {
+        externalDepositCount: sub.externalDeposits.length,
+        externalDepositTotal: round2(sub.externalDeposits.reduce((s, d) => s + d.amount, 0)),
+        withdrawalCount: sub.withdrawalEntries.length,
+        withdrawalTotal: round2(sub.withdrawalEntries.reduce((s, w) => s + w.amount, 0)),
+        feeCount: sub.feeEntries.length,
+        feeTotal: round2(sub.feeEntries.reduce((s, f) => s + f.amount, 0)),
+        projectedCount: projectedFlows.length,
+        projectedTotal: round2(projectedFlows.reduce((s, f) => s + f.amount, 0)),
+        netExpected: round2(
+          -sub.externalDeposits.reduce((s, d) => s + d.amount, 0)
+          + sub.withdrawalEntries.reduce((s, w) => s + w.amount, 0)
+          - sub.feeEntries.reduce((s, f) => s + f.amount, 0)
+          + projectedFlows.reduce((s, f) => s + f.amount, 0)
+        ),
       },
     };
   }
@@ -1751,7 +1795,9 @@ export default async function handler(req, res) {
           mgmtFeesLedger: 0, residualCommissionsLedger: 0,
           mgmtFeeCount: 0, residualCount: 0, hasLedgerFees: false,
           earliestDepositDate: null,
-          flowsByDate: {}, dailyFlows: {}, entryCount: 0, totalEntryCount: 0,
+          flowsByDate: {}, dailyFlows: {},
+          externalDeposits: [], withdrawalEntries: [], feeEntries: [],
+          entryCount: 0, totalEntryCount: 0,
         };
       }
 
@@ -1884,6 +1930,7 @@ export default async function handler(req, res) {
           hasLedgerFees: sub.hasLedgerFees,
         } : null,
         projectedFlows: flows.projectedFlowsMeta || null,
+        xirrComposition: flows.xirrComposition || null,
         derived: derived ? {
           dealsParticipated: derived.dealsParticipated,
           syndInvested: derived.syndInvested,
