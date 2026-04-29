@@ -345,23 +345,31 @@ async function pMap(items, fn, concurrency = 6) {
 //   define them here. Add new syndicators as their rates become known.
 //   _default is used when a syndicator has no explicit entry.
 // ============================================================================
+// ============================================================================
+// FEE CONFIG — historical fee rates per syndicator
+//
+// As of Apr 2026: SmartMCA's public API does not expose individual fee
+// transactions (Management Fee Paid One-Time, Fee Paid Per Transaction).
+// We probed `/accounting/entries` exhaustively and only found these source
+// types: merchantPayment, syndicationInvestment, syndicatorDeposit,
+// syndicatorWithdrawal, dealFunding. No fee source types exist in the public
+// API, even though the SmartMCA UI's CSV download for syndicators clearly
+// lists fee rows.
+//
+// The contacts endpoint returns `defaultManagementFeeEnabled` and confirms
+// LMJS is configured with 0% management fee at the SmartMCA level. The fees
+// shown in the spreadsheet must come from a different agreement/source not
+// surfaced via the public API.
+//
+// Therefore: we set rates to 0 across the board. The dashboard reflects what
+// the API actually says rather than fabricating numbers from back-computed
+// rates. SmartMCA support has been queried for the canonical fee endpoint;
+// once they expose it, replace this with API-driven fees.
+// ============================================================================
 const SYNDICATOR_FEE_CONFIG = {
-  // LMJS — rates back-computed from spreadsheet totals (2026-04-27 snapshot):
-  //   $37,569.30 mgmt fees / $424,365 funded → 8.8531%
-  //   $16,152.71 residuals / $313,436.70 collections → 5.1534%
-  // These are TEMPORARY values until LMJS confirms their actual contractual
-  // rates with SmartMCA. The 8.85% is unusual (not a round number); likely
-  // either (a) a different denominator than total funded is used in the
-  // spreadsheet, or (b) the rate is applied selectively (excluding some
-  // deal types). Worth resolving before treating these as canonical.
-  'cmo8qi0pj00vy01masnzahelz': {
-    name: 'LMJS',
-    managementFeeRate: 0.088531,
-    residualCommissionRate: 0.051534,
-  },
   _default: {
-    managementFeeRate: 0.12,
-    residualCommissionRate: 0.05,
+    managementFeeRate: 0,
+    residualCommissionRate: 0,
   },
 };
 
@@ -884,14 +892,34 @@ export default async function handler(req, res) {
         ? round2(synInfo.totalInvested)
         : sub.totalInvestmentsLedger;
 
-    // Cash Balance = Deposits - Investments + Collections - Fees - Withdrawals
-    const cashBalance = round2(
-      sub.totalDeposits
-      - totalInvestments
-      + derived.totalGrossCollections
-      - derived.totalFees
-      - sub.totalWithdrawals
-    );
+    // ========================================================================
+    // CASH BALANCE — uses SmartMCA's `details.runningBalance` from contacts.
+    // This is the canonical SmartMCA-side balance figure. NOTE: it does NOT
+    // currently match the "Available" figure shown in the SmartMCA UI; the
+    // UI's number comes from a separate computation we don't yet have access
+    // to via the public API. SmartMCA support has been queried for the
+    // canonical syndicator-balance endpoint.
+    //
+    // The previous formula (Deposits − Investments + Collections − Fees −
+    // Withdrawals) double-counted collections (they're already netted into
+    // the deposits via reinvestments) and over-subtracted derived fees.
+    // Removed in favor of trusting the system-of-record value SmartMCA
+    // returns directly.
+    //
+    // Fallback to derived formula only if synInfo.runningBalance is missing.
+    // ========================================================================
+    const cashBalance = (synInfo && synInfo.runningBalance != null)
+      ? round2(synInfo.runningBalance)
+      : round2(
+          sub.totalDeposits
+          - totalInvestments
+          + derived.totalGrossCollections
+          - derived.totalFees
+          - sub.totalWithdrawals
+        );
+    const cashBalanceSource = (synInfo && synInfo.runningBalance != null)
+      ? 'smartmca_running_balance'
+      : 'derived';
 
     // Unreturned Principal = Total Invested - Gross Collections (floored at 0)
     const unreturned = round2(Math.max(0, totalInvestments - derived.totalGrossCollections));
@@ -916,6 +944,7 @@ export default async function handler(req, res) {
     return {
       totalInvestments,
       cashBalance,
+      cashBalanceSource,
       unreturned,
       totalValue,
       netProfit,
@@ -1793,6 +1822,7 @@ export default async function handler(req, res) {
         ? fin.netCapitalDeployed
         : round2((agg.totalInvestedAll || 0) - (agg.totalDistributedAll || 0)),
       currentCashBalance: hasSyndicator ? fin.cashBalance : 0,
+      cashBalanceSource: hasSyndicator ? (fin.cashBalanceSource || 'derived') : 'aggregate',
 
       // Investment & Collections (rows 13-23)
       totalInvested: Math.round(totalInvested),
