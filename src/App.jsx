@@ -347,7 +347,6 @@ function SyndicatorPage({ DATA }) {
               </td>
               <td style={valB}>{fmt(s.totalGrossCollections)}</td>
             </tr>
-            <tr><td style={lbl}>Collections as % of Initial Invested</td><td style={val}>{fmt(s.collectionsPctExternal, "pct")}</td></tr>
           </tbody>
         </table>
       </div>
@@ -369,6 +368,7 @@ function SyndicatorPage({ DATA }) {
           <tbody>
             <tr><td colSpan={2} style={hdr}>RETURN METRICS</td></tr>
             <tr><td style={lbl}>Net Collections After Fees</td><td style={valB}>{fmt(s.netCollections)}</td></tr>
+            <tr><td style={lbl}>Net Collections as % of Initial Invested</td><td style={val}>{fmt(s.netCollectionsPctExternal, "pct")}</td></tr>
             <tr><td style={lbl}>Unreturned Principal (Still in Deals)</td><td style={val}>{fmt(s.unreturned)}</td></tr>
             <tr><td style={lbl}>Gross P&L (Collections − Capital − Fees)</td><td style={neg}>{fmt(s.grossPnL)}</td></tr>
           </tbody>
@@ -413,7 +413,7 @@ function SyndicatorPage({ DATA }) {
             <tr><td style={lbl}>Realized ROI</td><td style={val}>{fmt(s.realizedROI, "pct")}</td></tr>
             <tr><td style={lbl}></td><td style={val}></td></tr>
             <tr><td style={lbl}>Unrealized Value (Outstanding Principal)</td><td style={valB}>{fmt(s.unrealizedValue)}</td></tr>
-            <tr><td style={lbl}>% of Total Invested Still Outstanding</td><td style={val}>{fmt(s.pctStillOutstanding, "pct")}</td></tr>
+            <tr><td style={lbl}>% of Active RTR Still Unreturned</td><td style={val}>{fmt(s.pctActiveRtrUnreturned, "pct")}</td></tr>
           </tbody>
         </table>
       </div>

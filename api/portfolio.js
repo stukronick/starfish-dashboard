@@ -1621,6 +1621,33 @@ export default async function handler(req, res) {
     const collectionsPctExternal = (hasSyndicator && sub.externalCapital > 0)
       ? round2(totalGrossCollections / sub.externalCapital)
       : 0;
+    // Net Collections as % of Initial Invested — same as above but uses
+    // net-of-fees collections. Today fees from the API are $0 so this equals
+    // collectionsPctExternal; once SmartMCA populates fee entries this will
+    // diverge downward.
+    const netCollectionsPctExternal = (hasSyndicator && sub.externalCapital > 0)
+      ? round2(fin.netCollections / sub.externalCapital)
+      : 0;
+
+    // Active RTR Share: sum of LMJS's RTR slice across deals that still have
+    // outstanding to recover (dollarRemaining is a positive number — Profit
+    // deals are 'Paid Off', Default deals can be 0). This is the right
+    // denominator for forward-looking ratios because it focuses on the
+    // deals where money is still expected to flow, excluding old completed
+    // deals that would dilute the metric.
+    const activeRtrShare = hasSyndicator
+      ? perfs.reduce((sum, d) => {
+          const remaining = typeof d.dollarRemaining === 'number' ? d.dollarRemaining : 0;
+          if (remaining <= 0) return sum;
+          return sum + (d.rtr * d.syndPct);
+        }, 0)
+      : 0;
+    // Unreturned principal as a % of Active RTR — answers "of the money I'm
+    // still expecting from active deals, what fraction is just principal
+    // recovery vs. profit?" Higher = closer to break-even on those deals.
+    const pctActiveRtrUnreturned = (hasSyndicator && activeRtrShare > 0)
+      ? round2(fin.unreturned / activeRtrShare)
+      : 0;
     const feesPctInvested = totalInvested > 0
       ? round2(totalFees / totalInvested)
       : 0;
@@ -1665,6 +1692,9 @@ export default async function handler(req, res) {
       totalGrossCollections: Math.round(totalGrossCollections),
       collectionsPctInvested,
       collectionsPctExternal,
+      netCollectionsPctExternal,
+      activeRtrShare: Math.round(activeRtrShare),
+      pctActiveRtrUnreturned,
       // Fee Analysis (rows 25-30)
       managementFees: hasSyndicator ? Math.round(derived.managementFees) : 0,
       residualCommissions: hasSyndicator ? Math.round(derived.residualCommissions) : 0,
