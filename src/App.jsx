@@ -277,6 +277,37 @@ function SyndicatorPage({ DATA }) {
   let cum = 0;
   cashFlowChart.forEach(c => { cum += c.amount; c.cumulative = cum; });
 
+  // Download the exact xirrFlows used to derive Projected XIRR as a CSV.
+  // Open in Excel and run =XIRR(amount_column, date_column) to verify.
+  function downloadXirrFlowsCsv() {
+    const flows = DATA.xirrFlows || [];
+    if (flows.length === 0) {
+      alert("No XIRR flows available to download.");
+      return;
+    }
+    const header = "date,amount,type,description,deal";
+    const rows = flows.map(f => {
+      // Escape commas/quotes in description and type
+      const esc = (v) => {
+        const s = String(v == null ? "" : v);
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      return [esc(f.date), f.amount, esc(f.type || ""), esc(f.description || ""), esc(f.dealNo || "")].join(",");
+    });
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const synd = (s.syndicatorName || "syndicator").replace(/[^A-Za-z0-9_-]/g, "_");
+    const today = new Date().toISOString().slice(0, 10);
+    a.download = `xirr_flows_${synd}_${today}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   const vintageColors = ["#0077CF", "#f97316", "#eab308", "#166534", "#78CBFF", "#0596F2", "#FFB772"];
 
   // Curve data: horizon is dynamic, read from API. New shape: each row keyed
@@ -326,8 +357,7 @@ function SyndicatorPage({ DATA }) {
             <tr><td style={lbl}>Total Initial Invested</td><td style={valB}>{fmt(s.externalCapital)}</td></tr>
             <tr><td style={lbl}>Total Reinvested Returns</td><td style={val}>{fmt(s.reinvestedReturns)}</td></tr>
             <tr><td style={lbl}>Current Cash Available to Deploy</td><td style={grn}>{fmt(s.currentCashBalance)}</td></tr>
-            <tr><td style={lbl}>Total Withdrawals (Payouts)</td><td style={valB}>{fmt(s.totalWithdrawals)}</td></tr>
-            <tr><td style={lbl}>Net Capital Still Deployed</td><td style={valB}>{fmt(s.netCapitalDeployed)}</td></tr>
+            <tr><td style={lbl}>Net External Capital Returned (Round-Trip)</td><td style={val}>{fmt(s.totalWithdrawals)}</td></tr>
           </tbody>
         </table>
 
@@ -386,7 +416,24 @@ function SyndicatorPage({ DATA }) {
           <tr><td style={{ ...lbl, paddingLeft: 28 }}>− External Capital Contributed</td><td style={neg}>{fmt(-s.externalCapital)}</td></tr>
           <tr><td style={{ background: "#052B4C", color: "#fff", fontWeight: 700, fontSize: 14, padding: "12px 14px" }}>NET PROFIT / (LOSS)</td>
               <td style={{ background: "#052B4C", color: "#78CBFF", fontWeight: 700, fontSize: 16, padding: "12px 14px", textAlign: "right", fontFamily: "'Inria Sans'" }}>{fmt(s.netProfit)}</td></tr>
-          <tr><td style={lbl}>Projected XIRR (Annualized IRR)</td><td style={grn}>{fmt(s.projectedXIRR, "xirr")}</td></tr>
+          <tr>
+            <td style={lbl}>
+              Projected XIRR (Annualized IRR)
+              <button
+                onClick={downloadXirrFlowsCsv}
+                style={{
+                  marginLeft: 10, padding: "2px 8px", fontSize: 11,
+                  background: "#fff", border: "1px solid #B7E2FF",
+                  borderRadius: 3, color: "#084372", cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+                title="Download the exact cash flows used to compute this XIRR. Open in Excel and run =XIRR() on the amount and date columns to verify."
+              >
+                Download CSV
+              </button>
+            </td>
+            <td style={grn}>{fmt(s.projectedXIRR, "xirr")}</td>
+          </tr>
           <tr><td style={lbl}>Cash-on-Cash Multiple</td><td style={valB}>{fmt(s.cashOnCashMultiple, "multiple")}</td></tr>
         </tbody>
       </table>
