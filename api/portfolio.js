@@ -114,6 +114,21 @@ async function initKv() {
   }
 }
 
+// Phase 2: Statement parser. Loaded dynamically so the module continues to
+// load if the file is missing on a partial deploy. Once Phase 2 stabilises
+// (Step 3 — when we drop subledger), this can become a static import.
+let _parseStatement = null;
+async function loadParseStatement() {
+  if (_parseStatement !== null) return _parseStatement;
+  try {
+    const mod = await import('./parseStatement.js');
+    _parseStatement = { parse: mod.parseStatement, reconcile: mod.reconcileWithSummary };
+  } catch (err) {
+    _parseStatement = false;
+  }
+  return _parseStatement;
+}
+
 const TTL = {
   ACTIVE_DEAL: 30 * 60,           // 30 min in seconds (KV uses seconds)
   CLOSED_DEAL: 24 * 60 * 60,      // 24 hours
@@ -131,6 +146,9 @@ function pickTtlSeconds(path) {
   if (/^\/deals\/[^/?]+$/.test(path)) return TTL.ACTIVE_DEAL;          // upgraded later
   if (path.startsWith('/contacts?')) return TTL.CONTACTS;
   if (path.includes('/accounting/reports/subledger/')) return TTL.SUBLEDGER;
+  // Statement endpoint matches subledger semantics: per-syndicator transaction
+  // log that changes whenever new payments/distributions land, so 5min TTL.
+  if (/^\/syndicators\/[^/]+\/statement/.test(path)) return TTL.SUBLEDGER;
   return TTL.DEFAULT;
 }
 
@@ -2014,6 +2032,10 @@ export default async function handler(req, res) {
     let derived = null;   // syndications-derived: per-deal slice + collection breakdown
     let fin = null;       // combined: cashBalance, unreturned, totalValue, netProfit, etc.
     let feeConfig = null;
+    // Phase 2 Step 2: parallel statement parse (diagnostics-only — not yet
+    // wired into combineFinancials or anywhere else that affects display).
+    let parsedStatement = null;
+    let parsedStatementDiagnostics = null;
     let flows = {
       xirrFlows: [],
       cashFlowChart: [],
@@ -2026,15 +2048,36 @@ export default async function handler(req, res) {
       synInfo = allSyndicators.find(c => c.id === syndicatorId) || null;
       feeConfig = getFeeConfig(syndicatorId);
 
-      try {
-        const subResp = await apiFetch(
-          `/accounting/reports/subledger/syndicator/${syndicatorId}?limit=10000`
-        );
+      // ============================================================
+      // PHASE 2 STEP 2: Parallel statement fetch + parse, diagnostics-only.
+      //   We fetch both subledger (legacy) and statement (new) endpoints
+      //   in parallel, parse both, and compute diffs in the _debug block.
+      //   No production logic switches over yet — that's Step 3, after we
+      //   verify the parsed statement values match the legacy values for
+      //   real LMJS/Jacob data.
+      //
+      //   Statement endpoint accepts limit=10000 and returns all entries
+      //   in one round-trip (~1s for LMJS at 1814 entries). Same TTL as
+      //   subledger (5min) since both reflect transaction-level data.
+      //
+      //   Date range: hardcoded broad window (2020 → 2030) to ensure full
+      //   history. No reason to scope tighter — server returns everything
+      //   in scope and our cache absorbs the cost.
+      // ============================================================
+      const statementUrl = `/syndicators/${syndicatorId}/statement?start_date=2020-01-01&end_date=2030-12-31&format=json&limit=10000`;
+      const [subResult, stmtResult] = await Promise.allSettled([
+        apiFetch(`/accounting/reports/subledger/syndicator/${syndicatorId}?limit=10000`),
+        apiFetch(statementUrl),
+      ]);
+
+      // ---- Subledger (existing path) ----
+      if (subResult.status === 'fulfilled') {
+        const subResp = subResult.value;
         const entries = subResp.data?.entries
           || subResp.data?.data
           || (Array.isArray(subResp.data) ? subResp.data : []);
         sub = parseSubledger(entries);
-      } catch (e) {
+      } else {
         // Fail open: subledger unavailable -> zero-out cash-flow side, keep deal side.
         sub = {
           externalCapital: 0, reinvestedReturns: 0, feeRefunds: 0,
@@ -2047,6 +2090,62 @@ export default async function handler(req, res) {
           entryCount: 0, totalEntryCount: 0,
         };
       }
+
+      // ---- Statement (new, diagnostics-only) ----
+      // Wrapped so any failure here (parser bug, endpoint hiccup, missing
+      // import) cannot break the response. We surface the error in
+      // _debug.statement so we'll see it in the dashboard.
+      try {
+        const ps = await loadParseStatement();
+        if (ps && stmtResult.status === 'fulfilled') {
+          const parsed = ps.parse(stmtResult.value);
+          const summaryBlock = stmtResult.value?.data?.summary || null;
+          const reconcile = ps.reconcile(parsed, summaryBlock);
+          // Compute diffs vs the legacy paths (subledger for cash flows,
+          // synInfo from /syndicators/export for fees and balance).
+          const diffs = {};
+          if (sub) {
+            diffs.totalDepositedDelta    = round2((parsed.totalDeposited || 0)     - (sub.totalDeposits || 0));
+            diffs.totalWithdrawnDelta    = round2((parsed.totalWithdrawn || 0)     - (sub.totalWithdrawals || 0));
+            diffs.totalInvestedDelta     = round2((parsed.totalInvestedLedger||0)  - (sub.totalInvestmentsLedger || 0));
+            diffs.externalCapitalDelta   = round2((parsed.externalCapital || 0)    - (sub.externalCapital || 0));
+            diffs.reinvestmentsDelta     = round2((parsed.reinvestments || 0)      - (sub.reinvestedReturns || 0));
+          }
+          if (synInfo) {
+            diffs.cashBalanceDelta       = round2((parsed.closingBalance || 0)     - (synInfo.availableCash || 0));
+            diffs.cashCollectedDelta     = round2((parsed.cashCollectedGross || 0) - (synInfo.cashCollectedGross || 0));
+            diffs.totalFeesDelta         = round2((parsed.totalFeesNetOfReversals||0) - (synInfo.managementFees || 0));
+          }
+          parsedStatement = parsed;
+          parsedStatementDiagnostics = {
+            ok: true,
+            transactionCount: parsed.transactionCount,
+            reconcile,                 // {ok, deltas} from reconcileWithSummary
+            diffs,                     // deltas vs legacy data sources
+            unknownEntryCount: parsed.unknownEntryCount,
+          };
+        } else if (stmtResult.status === 'rejected') {
+          parsedStatementDiagnostics = {
+            ok: false,
+            reason: 'fetch_failed',
+            error: String(stmtResult.reason?.message || stmtResult.reason),
+          };
+        } else if (!ps) {
+          parsedStatementDiagnostics = {
+            ok: false,
+            reason: 'parser_module_unavailable',
+          };
+        }
+      } catch (e) {
+        parsedStatementDiagnostics = {
+          ok: false,
+          reason: 'parse_threw',
+          error: String(e.message || e),
+        };
+      }
+      // ============================================================
+      // END PHASE 2 STEP 2
+      // ============================================================
 
       // Aggregate per-deal syndication data + per-deal payment breakdown.
       // The fetchPayments callback wraps apiFetch so the cache layer
@@ -2196,6 +2295,42 @@ export default async function handler(req, res) {
           feeSource: derived.feeSource, // 'ledger' or 'derived'
         } : null,
         financials: fin,
+        // Phase 2 Step 2: parallel statement parse (diagnostics-only).
+        // When `ok: true`, the parser ran successfully on the statement
+        // endpoint and the `diffs` show how its values compare to the
+        // legacy paths (subledger and /syndicators/export). Goal for this
+        // step: confirm all diffs are ~0, then in Step 3 we drop the
+        // legacy paths and use the parser as primary.
+        statement: parsedStatementDiagnostics,
+        // Selected parsed values (only when parser ran successfully) so
+        // we can spot-check totals from the live response without needing
+        // to add a separate endpoint.
+        statementParsed: parsedStatement ? {
+          closingBalance:           parsedStatement.closingBalance,
+          computedAvailableCash:    parsedStatement.computedAvailableCash,
+          reconciliationDelta:      parsedStatement.reconciliationDelta,
+          transactionCount:         parsedStatement.transactionCount,
+          externalCapital:          parsedStatement.externalCapital,
+          reinvestments:            parsedStatement.reinvestments,
+          totalDeposited:           parsedStatement.totalDeposited,
+          totalWithdrawn:           parsedStatement.totalWithdrawn,
+          totalInvestedLedger:      parsedStatement.totalInvestedLedger,
+          cashCollectedGross:       parsedStatement.cashCollectedGross,
+          cashCollectedCreditsOnly: parsedStatement.cashCollectedCreditsOnly,
+          upfrontFees:              parsedStatement.upfrontFees,
+          residualCommissions:      parsedStatement.residualCommissions,
+          managementFees:           parsedStatement.managementFees,
+          totalFeesPaid:            parsedStatement.totalFeesPaid,
+          totalFeesNetOfReversals:  parsedStatement.totalFeesNetOfReversals,
+          reversalsCredit:          parsedStatement.reversalsCredit,
+          reversalsDebit:           parsedStatement.reversalsDebit,
+          // Per-deal counts only (full Maps would bloat response)
+          dealsWithCollections:     parsedStatement.collectionsByDeal.size,
+          dealsWithFees:            parsedStatement.feesByDeal.size,
+          dealsWithInvestments:     parsedStatement.investmentsByDeal.size,
+          // Flow series count, not the full series
+          xirrFlowCount:            parsedStatement.cashFlowsForXIRR.length,
+        } : null,
         feeConfig: feeConfig ? {
           managementFeeRate: feeConfig.managementFeeRate,
           residualCommissionRate: feeConfig.residualCommissionRate,
