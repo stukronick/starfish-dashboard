@@ -126,7 +126,8 @@ function OverviewPage({ DATA }) {
                 ["External Capital Contributed", s.externalCapital],
                 ["Reinvested Returns", s.reinvestedReturns],
                 ["Total Deposits", s.totalDeposits],
-                ["Total Withdrawals (Payouts)", -s.totalWithdrawals],
+                ["Total Invested in Deals", s.totalInvested],
+                ["Total Withdrawals (Payouts)", s.totalWithdrawals != null ? -s.totalWithdrawals : null],
                 ["Net Capital Deployed", s.netCapitalDeployed],
               ].map(([l, v]) => (
                 <div key={l} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #DFF0FF" }}>
@@ -144,7 +145,7 @@ function OverviewPage({ DATA }) {
             <div style={{ display: "grid", gap: 10, fontSize: 14 }}>
               {[
                 ["Total Gross Collections", s.totalGrossCollections],
-                ["Total Fees Paid", -s.totalFees],
+                ["Total Fees Paid", s.totalFees != null ? -s.totalFees : null],
                 ["Net Collections", s.netCollections],
                 ["Unreturned Principal", s.unreturned],
                 ["Realized P&L (Cash Only)", s.realizedPnL],

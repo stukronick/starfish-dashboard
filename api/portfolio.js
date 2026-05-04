@@ -1812,8 +1812,16 @@ export default async function handler(req, res) {
     const hasSyndicator = !!synInfo;
     // When no syndicator is selected, fall back to portfolio-wide aggregates.
     const totalInvested = hasSyndicator ? fin.totalInvestments : (agg.totalInvestedAll || 0);
-    const totalGrossCollections = hasSyndicator ? derived.totalGrossCollections : 0;
-    const totalFees = hasSyndicator ? fin.totalFees : 0;
+    // Portfolio detour: portfolio-wide gross collections + fees now come from
+    // /syndicators/export's availableCashBreakdown, summed across syndicators.
+    // Previously these were hard-zeroed because we only had per-syndicator
+    // detail; the new aggregate fields make the org-wide rollup meaningful.
+    const totalGrossCollections = hasSyndicator
+      ? derived.totalGrossCollections
+      : (agg.totalCashCollectedAll || 0);
+    const totalFees = hasSyndicator
+      ? fin.totalFees
+      : (agg.totalFeesAll || 0);
 
     const collectionsPctInvested = totalInvested > 0
       ? round2(totalGrossCollections / totalInvested)
@@ -1894,14 +1902,32 @@ export default async function handler(req, res) {
         : dates[0] ? Math.floor((new Date() - new Date(dates[0])) / 86400000) : 0,
 
       // Capital Activity (rows 5-11)
-      totalDeposits: hasSyndicator ? sub.totalDeposits : (agg.totalInvestedAll || 0),
-      externalCapital: hasSyndicator ? sub.externalCapital : (agg.totalInvestedAll || 0),
-      reinvestedReturns: hasSyndicator ? sub.reinvestedReturns : 0,
-      totalWithdrawals: hasSyndicator ? sub.totalWithdrawals : (agg.totalDistributedAll || 0),
+      // Per-syndicator: pulled from parsed statement (sub.*).
+      // Portfolio view: pulled from /syndicators/export aggregate sums.
+      //
+      // Note on labeling: previous code used `agg.totalInvestedAll` (which is
+      // money invested INTO deals) for both `totalDeposits` and `externalCapital`.
+      // That was wrong — these are different concepts. The fix:
+      //   - totalDeposits = sum of totalDeposited (cash IN to syndicator pool,
+      //                     includes reinvestments + fee refunds)
+      //   - externalCapital is NOT cleanly available from /syndicators/export
+      //     (would need each syndicator's statement parsed to split deposits
+      //     into external / reinvestment / refund). For portfolio view we
+      //     surface `null` so the UI can show "—" with a "select syndicator"
+      //     hint instead of a misleading number.
+      totalDeposits: hasSyndicator ? sub.totalDeposits : (agg.totalDepositedAll || 0),
+      externalCapital: hasSyndicator ? sub.externalCapital : null,
+      reinvestedReturns: hasSyndicator ? sub.reinvestedReturns : null,
+      totalWithdrawals: hasSyndicator ? sub.totalWithdrawals : (agg.totalWithdrawnAll || 0),
+      // Net Capital Deployed = (capital still invested in deals AND not yet
+      // withdrawn). For portfolio view, that's totalInvestedAll - totalWithdrawnAll
+      // (where totalInvestedAll is the deals-side number — sum of per-deal
+      // syndicator stakes — same definition as the per-syndicator path).
       netCapitalDeployed: hasSyndicator
         ? fin.netCapitalDeployed
-        : round2((agg.totalInvestedAll || 0) - (agg.totalDistributedAll || 0)),
-      currentCashBalance: hasSyndicator ? fin.cashBalance : 0,
+        : round2((agg.totalInvestedAll || 0) - (agg.totalWithdrawnAll || 0)),
+      // Available Cash for portfolio view is sum of per-syndicator available cash.
+      currentCashBalance: hasSyndicator ? fin.cashBalance : (agg.totalAvailableCashAll || 0),
       cashBalanceSource: hasSyndicator ? (fin.cashBalanceSource || 'derived') : 'aggregate',
 
       // Investment & Collections (rows 13-23)
@@ -1929,21 +1955,67 @@ export default async function handler(req, res) {
       feesPctCollections,
 
       // Return Metrics (rows 32-48)
-      netCollections: hasSyndicator ? Math.round(fin.netCollections) : 0,
-      unreturned: hasSyndicator ? Math.round(fin.unreturned) : 0,
-      // BUG #1 FIX: Gross P&L = Collections - External Capital - Fees (Returns
-      // Summary B36). Old code summed each deal's pAndL field which is the
-      // BUSINESS-level (full-deal) P&L, not the syndicator's share — and is
-      // structurally wrong for a hybrid model anyway. Spreadsheet for LMJS:
-      //   $313,437 - $235,000 - $53,722 = $24,715
+      // Per-syndicator: from fin (statement parse + canonical breakdown).
+      // Portfolio view: computed from /syndicators/export aggregate sums.
+      netCollections: hasSyndicator
+        ? Math.round(fin.netCollections)
+        : Math.round((agg.totalCashCollectedAll || 0) - (agg.totalFeesAll || 0)),
+      unreturned: hasSyndicator
+        ? Math.round(fin.unreturned)
+        : Math.round(agg.totalUnreturnedAll || 0),
+      // Gross P&L = Collections - External Capital - Fees. For portfolio view
+      // we don't have a clean "external capital" aggregate (see comment on
+      // Capital Activity section); the previous fallback summed each deal's
+      // pAndL which is structurally wrong for hybrid syndication model. Best
+      // available portfolio-wide approximation: Collections - Fees - sum of
+      // (deal-level net funded) which is what totalDistributedAll/totalWithdrawnAll
+      // measures cumulatively. We use that as a reasonable proxy.
       grossPnL: hasSyndicator
         ? Math.round(totalGrossCollections - sub.externalCapital - totalFees)
-        : Math.round(sumDeal(d => d.netReturn)),
-      totalCurrentValue: hasSyndicator ? Math.round(fin.totalValue) : 0,
-      netProfit: hasSyndicator ? Math.round(fin.netProfit) : 0,
+        : Math.round(
+            (agg.totalCashCollectedAll || 0)
+            - (agg.totalFeesAll || 0)
+            - (agg.totalWithdrawnAll || 0)  // proxy for "external capital still in"
+          ),
+      // Total Current Value = withdrawals + cash balance + unreturned. For
+      // portfolio view: same calculation on aggregates.
+      totalCurrentValue: hasSyndicator
+        ? Math.round(fin.totalValue)
+        : Math.round(
+            (agg.totalWithdrawnAll || 0)
+            + (agg.totalAvailableCashAll || 0)
+            + (agg.totalUnreturnedAll || 0)
+          ),
+      // Net Profit = Total Value - External Capital. For portfolio view we use
+      // totalDepositedAll as the "money in" denominator (cleanest available).
+      // Note this includes reinvestments + fee refunds, so it's slightly
+      // generous compared to a true external-only number — but it's the right
+      // economic question for a portfolio: total value vs. total capital pumped in.
+      netProfit: hasSyndicator
+        ? Math.round(fin.netProfit)
+        : Math.round(
+            (agg.totalWithdrawnAll || 0)
+            + (agg.totalAvailableCashAll || 0)
+            + (agg.totalUnreturnedAll || 0)
+            - (agg.totalDepositedAll || 0)
+          ),
+      // Projected XIRR is a per-syndicator time-weighted return. Not meaningful
+      // in the org-wide aggregate without per-syndicator XIRRs and a weighting
+      // scheme. Surface null for portfolio view; UI can show "—".
       projectedXIRR: hasSyndicator && flows?.projectedXIRR != null
-        ? round2(flows.projectedXIRR) : 0,
-      cashOnCashMultiple: hasSyndicator ? fin.cashOnCash : 0,
+        ? round2(flows.projectedXIRR) : null,
+      // Cash-on-Cash Multiple = Total Value / Capital Deposited. For portfolio
+      // view: same calculation on aggregates.
+      cashOnCashMultiple: hasSyndicator
+        ? fin.cashOnCash
+        : ((agg.totalDepositedAll || 0) > 0
+            ? round2(
+                ((agg.totalWithdrawnAll || 0)
+                + (agg.totalAvailableCashAll || 0)
+                + (agg.totalUnreturnedAll || 0))
+                / (agg.totalDepositedAll || 1)
+              )
+            : 0),
 
       // Deal Statistics (rows 51-57)
       dealsInProfit: profitCount,
@@ -1953,17 +2025,38 @@ export default async function handler(req, res) {
       defaultRate: perfs.length > 0 ? round2(defaultCount / perfs.length) : 0,
 
       // Realized vs Unrealized (rows 59+)
-      realizedValue: hasSyndicator ? Math.round(sub.totalWithdrawals + fin.cashBalance) : 0,
+      // Realized Value = Withdrawals + Available Cash (the "cashed out" portion).
+      // For portfolio view: sums across all syndicators.
+      realizedValue: hasSyndicator
+        ? Math.round(sub.totalWithdrawals + fin.cashBalance)
+        : Math.round((agg.totalWithdrawnAll || 0) + (agg.totalAvailableCashAll || 0)),
+      // Realized P&L = Realized Value - Capital In. For portfolio view we use
+      // totalDepositedAll as the capital-in denominator (best available).
       realizedPnL: hasSyndicator
         ? Math.round(sub.totalWithdrawals + fin.cashBalance - sub.externalCapital)
-        : 0,
+        : Math.round(
+            (agg.totalWithdrawnAll || 0)
+            + (agg.totalAvailableCashAll || 0)
+            - (agg.totalDepositedAll || 0)
+          ),
       realizedROI: hasSyndicator && sub.externalCapital > 0
         ? round2((sub.totalWithdrawals + fin.cashBalance - sub.externalCapital) / sub.externalCapital)
-        : 0,
-      unrealizedValue: hasSyndicator ? Math.round(fin.unreturned) : 0,
+        : (!hasSyndicator && (agg.totalDepositedAll || 0) > 0
+            ? round2(
+                ((agg.totalWithdrawnAll || 0)
+                + (agg.totalAvailableCashAll || 0)
+                - (agg.totalDepositedAll || 0))
+                / (agg.totalDepositedAll || 1)
+              )
+            : 0),
+      unrealizedValue: hasSyndicator
+        ? Math.round(fin.unreturned)
+        : Math.round(agg.totalUnreturnedAll || 0),
       pctStillOutstanding: hasSyndicator && totalInvested > 0
         ? round2(fin.unreturned / totalInvested)
-        : 0,
+        : (!hasSyndicator && (agg.totalInvestedAll || 0) > 0
+            ? round2((agg.totalUnreturnedAll || 0) / (agg.totalInvestedAll || 1))
+            : 0),
       xirrFullRecovery: hasSyndicator && flows?.xirrFullRecovery != null
         ? round2(flows.xirrFullRecovery) : 0,
       xirrTotalLoss: hasSyndicator && flows?.xirrTotalLoss != null
@@ -2057,6 +2150,21 @@ export default async function handler(req, res) {
       totalAvailableCashAll: allSyndicators.reduce((s, c) => s + c.availableCash, 0),
       totalDepositedAll: allSyndicators.reduce((s, c) => s + c.totalDeposited, 0),
       totalWithdrawnAll: allSyndicators.reduce((s, c) => s + c.totalWithdrawn, 0),
+      // Phase 2 detour: portfolio-wide return-side aggregates from
+      // /syndicators/export's availableCashBreakdown. These let the Portfolio
+      // Overview tab fill in Total Gross Collections, Total Fees Paid, Net
+      // Collections, Unreturned Principal, and derived metrics that previously
+      // showed $0 when no syndicator was selected.
+      totalCashCollectedAll: allSyndicators.reduce((s, c) => s + c.cashCollectedGross, 0),
+      // managementFees field from API is misnamed: actually ALL-IN fees
+      // (upfront feeDeductions + per-payment syndicationFees, net of reversals).
+      totalFeesAll: allSyndicators.reduce((s, c) => s + c.managementFees, 0),
+      // Per-syndicator unreturned (floored at 0), then summed. Flooring per-
+      // syndicator (rather than on aggregate sums) gives the same total that
+      // would appear if you visited each syndicator page individually.
+      totalUnreturnedAll: allSyndicators.reduce(
+        (s, c) => s + Math.max(0, c.totalInvestedLedger - c.cashCollectedGross), 0
+      ),
       // Legacy aliases for backwards compatibility with downstream code that
       // expects these names. Both now point at canonical values:
       //   totalRunningBalanceAll → availableCash sum (was details.runningBalance)
