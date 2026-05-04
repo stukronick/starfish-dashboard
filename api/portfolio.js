@@ -2110,6 +2110,7 @@ export default async function handler(req, res) {
             diffs.totalInvestedDelta     = round2((parsed.totalInvestedLedger||0)  - (sub.totalInvestmentsLedger || 0));
             diffs.externalCapitalDelta   = round2((parsed.externalCapital || 0)    - (sub.externalCapital || 0));
             diffs.reinvestmentsDelta     = round2((parsed.reinvestments || 0)      - (sub.reinvestedReturns || 0));
+            diffs.feeRefundsDelta        = round2((parsed.feeRefunds || 0)         - (sub.feeRefunds || 0));
           }
           if (synInfo) {
             diffs.cashBalanceDelta       = round2((parsed.closingBalance || 0)     - (synInfo.availableCash || 0));
@@ -2312,6 +2313,7 @@ export default async function handler(req, res) {
           transactionCount:         parsedStatement.transactionCount,
           externalCapital:          parsedStatement.externalCapital,
           reinvestments:            parsedStatement.reinvestments,
+          feeRefunds:               parsedStatement.feeRefunds,
           totalDeposited:           parsedStatement.totalDeposited,
           totalWithdrawn:           parsedStatement.totalWithdrawn,
           totalInvestedLedger:      parsedStatement.totalInvestedLedger,

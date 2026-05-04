@@ -49,9 +49,21 @@ function r2(v) {
 
 // Description matchers. The API's descriptions are stable strings prefixed
 // by category; we match case-insensitively for safety.
+//
+// Reinvestment classification: a deposit-type entry counts as reinvestment if
+// its description mentions "reinvest" (catches "reinvestment", "Re-investment"
+// with a hyphen, "syndicator reinvestment", etc.) OR mentions "payout" (some
+// SmartMCA descriptions read like "2025 Syndicator Payout + Re-investment"
+// or paired payout/redeposit conventions). Matches the legacy parseSubledger
+// behavior so external/reinvestment splits agree across both code paths.
 const RX = {
-  reinvestment:        /reinvest/i,
+  // Catches: reinvest, reinvestment, Re-investment (with hyphen). Allows an
+  // optional non-letter character between "re" and "invest".
+  reinvestment:        /re[-\s]?invest/i,
   payout:              /payout/i,
+  // Fee refunds — credit-side entries that reverse a previously-paid upfront
+  // fee. NOT external capital and NOT reinvestment.
+  feeRefund:           /refund/i,
   residualCommission:  /^Residual Commission/i,
   managementFeePayment:/^MANAGEMENT FEE/i,
   balanceTransferIn:   /balance_transfer_in/i,
@@ -73,12 +85,24 @@ function classifyEntry(entry) {
 
   switch (type) {
     case 'deposit':
-      // Distinguish external (real new capital) from reinvestment (rolled
-      // returns). Both increase the cash balance, but only external counts as
-      // "money the user actually put in from outside."
-      return RX.reinvestment.test(desc)
-        ? { category: 'reinvestment',    signedAmount: amt, dealId, date, type, desc }
-        : { category: 'externalDeposit', signedAmount: amt, dealId, date, type, desc };
+      // Distinguish three sub-categories of deposit credits:
+      //   1. Fee refund — refund of a previously-charged upfront fee. NOT
+      //      capital; tracked separately so display totals don't double-count.
+      //   2. Reinvestment — payout that's immediately re-deposited. Doesn't
+      //      represent new outside capital; doesn't create an XIRR flow.
+      //   3. External deposit — actual new capital from the syndicator's
+      //      pocket. Counts as both totalDeposited AND a NEGATIVE XIRR flow.
+      //
+      // Order matters: a description like "Upfront Fee REFUND" might happen to
+      // also contain other words; match REFUND first since it's the most
+      // specific. Then reinvest/payout, then everything else is external.
+      if (RX.feeRefund.test(desc)) {
+        return { category: 'feeRefund', signedAmount: amt, dealId, date, type, desc };
+      }
+      if (RX.reinvestment.test(desc) || RX.payout.test(desc)) {
+        return { category: 'reinvestment', signedAmount: amt, dealId, date, type, desc };
+      }
+      return { category: 'externalDeposit', signedAmount: amt, dealId, date, type, desc };
 
     case 'withdrawal':
       return { category: 'withdrawal', signedAmount: amt, dealId, date, type, desc };
@@ -145,9 +169,10 @@ export function parseStatement(statementResponse) {
   const summary = root.summary || root.data?.summary || null;
 
   // Aggregate accumulators — one running total per category.
-  let externalCapital   = 0;   // sum of positive "deposit" entries (excl. reinvest)
-  let reinvestments     = 0;   // sum of positive "deposit" entries marked reinvest
-  let totalDeposited    = 0;   // externalCapital + reinvestments (all deposit credits)
+  let externalCapital   = 0;   // sum of positive "deposit" entries (excl. reinvest, refund)
+  let reinvestments     = 0;   // sum of positive "deposit" entries marked reinvest/payout
+  let feeRefunds        = 0;   // sum of positive "deposit" entries marked refund
+  let totalDeposited    = 0;   // externalCapital + reinvestments + feeRefunds (matches API)
   let totalWithdrawn    = 0;   // sum of withdrawal debits (positive number)
   let totalInvested     = 0;   // sum of investment debits (positive number)
   let cashCollectedNet  = 0;   // signed sum of paymentShareAllocated (handles bt_out)
@@ -202,6 +227,13 @@ export function parseStatement(statementResponse) {
         // Reinvestments are NOT XIRR flows — they're internal money cycling
         // back in (was already counted as a positive collection earlier).
         // Skipping here matches the existing XIRR engine's logic.
+        break;
+      case 'feeRefund':
+        feeRefunds     += amt;        // amt > 0
+        totalDeposited += amt;        // still counts toward total deposits (API treats it that way)
+        // Fee refunds are NOT XIRR flows — they're a reversal of a previously
+        // paid fee. The original fee was a negative flow; the refund netting
+        // it out doesn't represent a return on capital.
         break;
       case 'withdrawal':
         totalWithdrawn += abs;        // amt < 0, store as positive total
@@ -328,6 +360,7 @@ export function parseStatement(statementResponse) {
     // ---- Capital flow aggregates ----
     externalCapital:    r2(externalCapital),
     reinvestments:      r2(reinvestments),
+    feeRefunds:         r2(feeRefunds),
     totalDeposited:     r2(totalDeposited),
     totalWithdrawn:     r2(totalWithdrawn),
     totalInvestedLedger:r2(totalInvested),
