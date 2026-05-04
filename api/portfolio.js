@@ -1060,6 +1060,50 @@ export default async function handler(req, res) {
   //   Returns null if iteration doesn't converge or result is unreasonable.
   //   Frontend should render null as "—" or "N/A".
   // ==========================================================================
+  // ============================================================================
+  // SLIM XIRR SERIES FOR CLIENT-SIDE RECOMPUTATION
+  // ============================================================================
+  // The dashboard exposes a "Projection Confidence" slider (Optimistic /
+  // Realistic / Conservative) that scales projected forward flows by
+  // (1 - haircut). To keep that responsive, we send the flow series to the
+  // client and re-run XIRR there. To keep payload small, we:
+  //
+  //   1. Aggregate historical flows by date — slider can't change them, so
+  //      we only need ONE entry per date with the net signed amount.
+  //   2. Send projected flows individually (each gets re-haircut as the
+  //      slider moves).
+  //
+  // For LMJS this compresses ~2,400 individual flow events down to ~200
+  // historical-by-date bins + ~670 projected entries ≈ 30KB payload.
+  function buildXirrSeriesForClient(xirrFlows) {
+    if (!xirrFlows || xirrFlows.length === 0) {
+      return { historicalByDate: [], projected: [] };
+    }
+    // Projected flows are tagged with type starting with 'Projected' (Projected
+    // Payment from generateProjectedPayments, Projected Recovery from
+    // generateDefaultRecovery).
+    const isProjected = (f) =>
+      typeof f.type === 'string' && f.type.startsWith('Projected');
+
+    // Aggregate historical flows by date for compactness.
+    const histByDate = new Map();
+    const projected = [];
+    for (const f of xirrFlows) {
+      if (isProjected(f)) {
+        projected.push({ date: f.date, amount: round2(f.amount) });
+      } else {
+        const d = f.date.length > 10 ? f.date.slice(0, 10) : f.date;
+        histByDate.set(d, round2((histByDate.get(d) || 0) + f.amount));
+      }
+    }
+
+    const historicalByDate = Array.from(histByDate.entries())
+      .map(([date, amount]) => ({ date, amount }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    return { historicalByDate, projected };
+  }
+
   function computeXirr(flows) {
     if (!flows || flows.length < 2) return null;
 
@@ -2794,6 +2838,13 @@ export default async function handler(req, res) {
       vintagesBiz,
       xirrFlows: flows.xirrFlows,
       cashFlowChart: flows.cashFlowChart,
+      // Compact XIRR series for client-side recompute when the user adjusts
+      // the Projection Confidence slider. When a syndicator is selected this
+      // is the per-syndicator series; otherwise it's the portfolio-wide one
+      // (composed from all syndicators' parsed statements + projections).
+      xirrSeriesForRecompute: syndicatorId
+        ? buildXirrSeriesForClient(flows.xirrFlows)
+        : (portfolioFlows ? buildXirrSeriesForClient(portfolioFlows.xirrFlows) : null),
       summary,
       aggregate,
       _debug: {

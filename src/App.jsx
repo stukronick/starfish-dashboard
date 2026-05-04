@@ -17,6 +17,133 @@ const fmt = (v, type = "currency") => {
 
 const clr = (v) => v > 0 ? "#166534" : v < 0 ? "#CC0000" : "#084372";
 
+// ============================================================================
+// CLIENT-SIDE XIRR (for the Projection Confidence slider)
+// ============================================================================
+// Computes the rate r where sum(amount_i / (1+r)^((date_i - date_0) / 365)) = 0
+// Uses scan + bisection — same algorithm as the server (api/portfolio.js
+// computeXirr) so results match exactly when given the same inputs.
+//
+// Inputs: array of { date: 'YYYY-MM-DD', amount: number }
+// Output: rate as decimal (e.g. 1.5 = 150%) or null if no solution.
+function computeXirrClient(flows) {
+  if (!flows || flows.length < 2) return null;
+  const points = flows
+    .map(f => ({
+      date: new Date(f.date).getTime(),
+      amount: typeof f.amount === "number" ? f.amount : parseFloat(f.amount),
+    }))
+    .filter(p => !isNaN(p.date) && !isNaN(p.amount) && p.amount !== 0)
+    .sort((a, b) => a.date - b.date);
+  if (points.length < 2) return null;
+  const hasPos = points.some(p => p.amount > 0);
+  const hasNeg = points.some(p => p.amount < 0);
+  if (!hasPos || !hasNeg) return null;
+  const t0 = points[0].date;
+  const dayMs = 86400000;
+  const npv = (r) => {
+    if (r <= -1) return Infinity;
+    let s = 0;
+    for (const p of points) {
+      const t = (p.date - t0) / dayMs / 365;
+      s += p.amount / Math.pow(1 + r, t);
+    }
+    return s;
+  };
+  const SCAN_LO = -0.95, SCAN_HI = 10.0, STEPS = 80;
+  let prevR = SCAN_LO, prevN = npv(prevR);
+  for (let i = 1; i <= STEPS; i++) {
+    const r = SCAN_LO + ((SCAN_HI - SCAN_LO) * i) / STEPS;
+    const f = npv(r);
+    if (isFinite(f) && isFinite(prevN) && Math.sign(prevN) !== Math.sign(f) && prevN !== 0) {
+      let lo = prevR, hi = r, fLo = prevN;
+      for (let j = 0; j < 60; j++) {
+        const mid = (lo + hi) / 2;
+        const fMid = npv(mid);
+        if (Math.abs(fMid) < 1e-6 || (hi - lo) < 1e-6) {
+          if (mid < -0.99 || mid > 10) return null;
+          return mid;
+        }
+        if (Math.sign(fMid) === Math.sign(fLo)) { lo = mid; fLo = fMid; }
+        else { hi = mid; }
+      }
+      return (lo + hi) / 2;
+    }
+    prevR = r; prevN = f;
+  }
+  return null;
+}
+
+// Confidence presets — drive the haircut applied to projected (forward) flows.
+// Stored to localStorage under this key so the user's choice persists across
+// page loads. Default: "realistic".
+const CONFIDENCE_KEY = "starfish.projectionConfidence";
+const CONFIDENCE_PRESETS = [
+  { id: "optimistic",   label: "Optimistic",   haircut: 0.00, hint: "Projects to full RTR" },
+  { id: "realistic",    label: "Realistic",    haircut: 0.10, hint: "Accounts for typical delays" },
+  { id: "conservative", label: "Conservative", haircut: 0.25, hint: "Heavier friction assumed" },
+];
+const DEFAULT_CONFIDENCE = "realistic";
+
+function getStoredConfidence() {
+  if (typeof localStorage === "undefined") return DEFAULT_CONFIDENCE;
+  try {
+    const v = localStorage.getItem(CONFIDENCE_KEY);
+    return CONFIDENCE_PRESETS.some(p => p.id === v) ? v : DEFAULT_CONFIDENCE;
+  } catch { return DEFAULT_CONFIDENCE; }
+}
+function setStoredConfidence(id) {
+  if (typeof localStorage === "undefined") return;
+  try { localStorage.setItem(CONFIDENCE_KEY, id); } catch { /* quota or denied */ }
+}
+
+// Recomputes projected XIRR from the slim {historicalByDate, projected}
+// payload by applying (1 - haircut) to projected flows. Memoize on the
+// caller side — this is cheap (<5ms) but called on every render.
+function recomputeProjectedXirr(xirrSeries, haircut) {
+  if (!xirrSeries) return null;
+  const all = [];
+  for (const h of (xirrSeries.historicalByDate || [])) all.push(h);
+  const scale = 1 - haircut;
+  for (const p of (xirrSeries.projected || [])) {
+    all.push({ date: p.date, amount: p.amount * scale });
+  }
+  return computeXirrClient(all);
+}
+
+// Projection Confidence selector — three preset buttons that affect Projected
+// XIRR display.  Compact pill-style buttons; the active preset is filled.
+function ConfidenceSelector({ value, onChange, computedXirr }) {
+  const buttonStyle = (active) => ({
+    padding: "6px 14px",
+    borderRadius: 999,
+    border: active ? "1px solid #0596F2" : "1px solid #DFF0FF",
+    background: active ? "rgba(5,150,242,0.15)" : "#ffffff",
+    color: active ? "#084372" : "#5a7a9a",
+    fontWeight: active ? 700 : 500,
+    fontSize: 12,
+    cursor: "pointer",
+    fontFamily: "'Inria Sans', sans-serif",
+  });
+  const active = CONFIDENCE_PRESETS.find(p => p.id === value);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        {CONFIDENCE_PRESETS.map(p => (
+          <button key={p.id} style={buttonStyle(p.id === value)} onClick={() => onChange(p.id)} title={p.hint}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+      {active && (
+        <div style={{ fontSize: 11, color: "#5a7a9a" }}>
+          {(active.haircut * 100).toFixed(0)}% projection haircut · {active.hint}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Syndicators loaded from API
 
 // --- Components ---
@@ -49,6 +176,25 @@ function OverviewPage({ DATA }) {
   const s = DATA.summary;
   const [dealSort, setDealSort] = useState("status");
   const [dealFilter, setDealFilter] = useState("All");
+
+  // Projection Confidence — drives haircut on projected forward flows. The
+  // selected preset is persisted to localStorage; default is "realistic".
+  const [confidence, setConfidence] = useState(() => getStoredConfidence());
+  const onConfidenceChange = useCallback((id) => {
+    setConfidence(id);
+    setStoredConfidence(id);
+  }, []);
+  const haircut = useMemo(
+    () => CONFIDENCE_PRESETS.find(p => p.id === confidence)?.haircut ?? 0.10,
+    [confidence]
+  );
+  // Recompute Projected XIRR on the client using the slim series + haircut.
+  // Falls back to the server-computed value if no slim series was returned
+  // (e.g., portfolio fan-out failed; then projectedXirrLive === s.projectedXIRR).
+  const projectedXirrLive = useMemo(() => {
+    if (!DATA.xirrSeriesForRecompute) return s.projectedXIRR;
+    return recomputeProjectedXirr(DATA.xirrSeriesForRecompute, haircut);
+  }, [DATA.xirrSeriesForRecompute, haircut, s.projectedXIRR]);
 
   const statusData = [
     { name: "Active", value: s.dealsActiveBelowBasis },
@@ -90,7 +236,14 @@ function OverviewPage({ DATA }) {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginBottom: 32 }}>
         <KpiCard label="External Capital Contributed" value={fmt(s.externalCapital)} sub={`${s.numDeals} deals · avg ${fmt(s.avgDealSize)}`} />
         <KpiCard label="Net Profit (Total Value)" value={fmt(s.netProfit)} accent={clr(s.netProfit)} sub={`Cash-on-Cash ${fmt(s.cashOnCashMultiple, "multiple")}`} />
-        <KpiCard label="Projected XIRR" value={fmt(s.projectedXIRR, "xirr")} accent="#FD8E3A" />      </div>
+        <div style={{ background: "#ffffff", border: "1px solid #DFF0FF", borderRadius: 12, padding: "20px 24px", boxShadow: "0 1px 4px rgba(8,67,114,0.06)" }}>
+          <div style={{ fontSize: 12, color: "#8892a4", fontWeight: 500, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 8 }}>Projected XIRR</div>
+          <div style={{ fontSize: 26, fontWeight: 700, color: "#FD8E3A", fontFamily: "'Inria Sans', sans-serif", marginBottom: 10 }}>
+            {fmt(projectedXirrLive, "xirr")}
+          </div>
+          <ConfidenceSelector value={confidence} onChange={onConfidenceChange} computedXirr={projectedXirrLive} />
+        </div>
+      </div>
 
       {/* Portfolio Summary */}
       <div style={{ background: "#ffffff", borderRadius: 12, padding: 24, border: "1px solid #DFF0FF", boxShadow: "0 1px 4px rgba(8,67,114,0.06)", marginBottom: 32 }}>
@@ -260,6 +413,22 @@ function OverviewPage({ DATA }) {
 function SyndicatorPage({ DATA }) {
   const s = DATA.summary;
   const [dealFilter, setDealFilter] = useState("All");
+
+  // Projection Confidence — same mechanism as OverviewPage. Persisted state
+  // is shared across both tabs (one CONFIDENCE_KEY in localStorage).
+  const [confidence, setConfidence] = useState(() => getStoredConfidence());
+  const onConfidenceChange = useCallback((id) => {
+    setConfidence(id);
+    setStoredConfidence(id);
+  }, []);
+  const haircut = useMemo(
+    () => CONFIDENCE_PRESETS.find(p => p.id === confidence)?.haircut ?? 0.10,
+    [confidence]
+  );
+  const projectedXirrLive = useMemo(() => {
+    if (!DATA.xirrSeriesForRecompute) return s.projectedXIRR;
+    return recomputeProjectedXirr(DATA.xirrSeriesForRecompute, haircut);
+  }, [DATA.xirrSeriesForRecompute, haircut, s.projectedXIRR]);
   const filteredDeals = DATA.dealPerf
     .filter(d => dealFilter === "All" || d.status === dealFilter)
     .sort((a, b) => { const o = { "Active": 0, "Profit": 1, "Default": 2 }; return (o[a.status]||0) - (o[b.status]||0); });
@@ -438,8 +607,11 @@ function SyndicatorPage({ DATA }) {
               >
                 Download CSV
               </button>
+              <div style={{ marginTop: 8 }}>
+                <ConfidenceSelector value={confidence} onChange={onConfidenceChange} computedXirr={projectedXirrLive} />
+              </div>
             </td>
-            <td style={grn}>{fmt(s.projectedXIRR, "xirr")}</td>
+            <td style={grn}>{fmt(projectedXirrLive, "xirr")}</td>
           </tr>
           <tr><td style={lbl}>Cash-on-Cash Multiple</td><td style={valB}>{fmt(s.cashOnCashMultiple, "multiple")}</td></tr>
         </tbody>
