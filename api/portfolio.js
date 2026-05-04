@@ -1583,6 +1583,121 @@ export default async function handler(req, res) {
   }
 
   // ==========================================================================
+  // 6b. PORTFOLIO-WIDE FLOWS  (Phase 2 detour)
+  //
+  // Portfolio Overview tab needs a projected XIRR that aggregates across all
+  // syndicators. We can't average per-syndicator XIRRs (mathematically
+  // meaningless for time-weighted returns), so we compose ONE flow series
+  // across all syndicators and run XIRR on it.
+  //
+  // Inputs:
+  //   - perSyndicatorParsed: Map<syndicatorId, parsedStatement> from the
+  //     fan-out done at the top of the request handler. Each entry already
+  //     has cashFlowsForXIRR with real dates and real amounts.
+  //   - deals: full deals list, used for projected forward flows on actives.
+  //
+  // Composition (per syndicator, then concat):
+  //   1. Historical flows from parsed.cashFlowsForXIRR, FILTERED to:
+  //        - externalDeposit  (negative)
+  //        - collection       (positive, gross)
+  //        - residualCommission/managementFee/upfrontFee  (negative, real fees)
+  //      Excluded:
+  //        - withdrawal       (cashout to user, not a return-on-investment event)
+  //        - reinvestment     (already excluded by parseStatement itself)
+  //        - reversal         (small noise; net effect tiny)
+  //
+  //   2. Projected forward flows from buildProjectedFlows(deals, syndicatorId)
+  //      using DEFAULT_SCENARIO (5% commission, 0% recovery on defaulted →
+  //      defaulted deals get $0 from today onward, active deals project to
+  //      full RTR with cadence inferred from history).
+  //
+  // The result is more accurate than the per-syndicator XIRR computed today
+  // because it uses real fee dates instead of the rate-based approximation.
+  // ==========================================================================
+  function buildPortfolioFlows(perSyndicatorParsed, deals, scenario = DEFAULT_SCENARIO) {
+    if (!perSyndicatorParsed || perSyndicatorParsed.size === 0) {
+      return { xirrFlows: [], projectedXIRR: null, composition: null };
+    }
+
+    const xirrFlows = [];
+    let externalDepositCount = 0;
+    let externalDepositTotal = 0;  // positive (we'll negate when pushing)
+    let collectionCount = 0;
+    let collectionTotal = 0;
+    let feeCount = 0;
+    let feeTotal = 0;              // positive (we'll negate when pushing)
+    let projectedCount = 0;
+    let projectedTotal = 0;
+
+    // Categories we keep from each parsed statement's cashFlowsForXIRR.
+    // Withdrawals are excluded (cashout to user, not a return event).
+    const KEEP = new Set([
+      'externalDeposit',     // already negative-signed in parsed series
+      'collection',          // positive
+      'residualCommission',  // negative
+      'managementFee',       // negative
+      'upfrontFee',          // negative
+    ]);
+
+    for (const [syndicatorId, parsed] of perSyndicatorParsed.entries()) {
+      // 1. Historical flows from this syndicator's statement
+      for (const f of parsed.cashFlowsForXIRR) {
+        if (!KEEP.has(f.category)) continue;
+        xirrFlows.push({
+          date: f.date.slice(0, 10),
+          amount: f.amount,                   // already signed
+          type: f.category,
+          description: `${syndicatorId.slice(-6)} ${f.category}`,
+          dealNo: f.dealId || null,
+          syndicatorId,
+        });
+        if (f.category === 'externalDeposit') {
+          externalDepositCount++;
+          externalDepositTotal += -f.amount;  // amount is negative; track positive total
+        } else if (f.category === 'collection') {
+          collectionCount++;
+          collectionTotal += f.amount;
+        } else {
+          feeCount++;
+          feeTotal += -f.amount;              // amount is negative; track positive total
+        }
+      }
+
+      // 2. Projected forward flows from active deals where this syndicator participates
+      const projectedFlows = buildProjectedFlows(deals, syndicatorId, scenario);
+      for (const p of projectedFlows) {
+        xirrFlows.push({ ...p, syndicatorId });
+        projectedCount++;
+        projectedTotal += p.amount;
+      }
+    }
+
+    xirrFlows.sort((a, b) => a.date.localeCompare(b.date));
+
+    const projectedXIRR = computeXirr(xirrFlows);
+
+    return {
+      xirrFlows,
+      projectedXIRR,
+      composition: {
+        externalDepositCount,
+        externalDepositTotal: round2(externalDepositTotal),
+        collectionCount,
+        collectionTotal: round2(collectionTotal),
+        feeCount,
+        feeTotal: round2(feeTotal),
+        projectedCount,
+        projectedTotal: round2(projectedTotal),
+        netExpected: round2(
+          -externalDepositTotal + collectionTotal - feeTotal + projectedTotal
+        ),
+        syndicatorsContributing: perSyndicatorParsed.size,
+        scenario,
+      },
+    };
+  }
+
+  // ==========================================================================
   // 7. VINTAGE ANALYSIS  (deal-level, unchanged)
   // ==========================================================================
   function computeVintages(perfs) {
@@ -1801,7 +1916,7 @@ export default async function handler(req, res) {
   // 9. BUILD SUMMARY  (matches 'Returns Summary' sheet layout)
   //    Uses sub + derived + fin. Field names preserved for the frontend.
   // ==========================================================================
-  function buildSummary(perfs, sub, derived, fin, synInfo, aggregate, flows) {
+  function buildSummary(perfs, sub, derived, fin, synInfo, aggregate, flows, portfolioFlows) {
     const sumDeal = (fn) => perfs.reduce((s, d) => s + fn(d), 0);
     const dates = perfs.map(d => d.fundedDate).filter(Boolean).sort();
     const profitCount = perfs.filter(d => d.status === 'Profit').length;
@@ -1903,29 +2018,29 @@ export default async function handler(req, res) {
 
       // Capital Activity (rows 5-11)
       // Per-syndicator: pulled from parsed statement (sub.*).
-      // Portfolio view: pulled from /syndicators/export aggregate sums.
+      // Portfolio view: pulled from /syndicators/export aggregates and the
+      // per-syndicator statement fan-out (when available).
       //
-      // Note on labeling: previous code used `agg.totalInvestedAll` (which is
-      // money invested INTO deals) for both `totalDeposits` and `externalCapital`.
-      // That was wrong — these are different concepts. The fix:
-      //   - totalDeposits = sum of totalDeposited (cash IN to syndicator pool,
-      //                     includes reinvestments + fee refunds)
-      //   - externalCapital is NOT cleanly available from /syndicators/export
-      //     (would need each syndicator's statement parsed to split deposits
-      //     into external / reinvestment / refund). For portfolio view we
-      //     surface `null` so the UI can show "—" with a "select syndicator"
-      //     hint instead of a misleading number.
+      // externalCapital and reinvestedReturns now have real portfolio-wide
+      // values via the statement fan-out. If the fan-out failed or is
+      // unavailable, agg.externalCapitalAll will be null and the UI shows "—".
       totalDeposits: hasSyndicator ? sub.totalDeposits : (agg.totalDepositedAll || 0),
-      externalCapital: hasSyndicator ? sub.externalCapital : null,
-      reinvestedReturns: hasSyndicator ? sub.reinvestedReturns : null,
+      externalCapital: hasSyndicator
+        ? sub.externalCapital
+        : (agg.externalCapitalAll != null ? round2(agg.externalCapitalAll) : null),
+      reinvestedReturns: hasSyndicator
+        ? sub.reinvestedReturns
+        : (agg.reinvestmentsAll != null ? round2(agg.reinvestmentsAll) : null),
       totalWithdrawals: hasSyndicator ? sub.totalWithdrawals : (agg.totalWithdrawnAll || 0),
       // Net Capital Deployed = (capital still invested in deals AND not yet
-      // withdrawn). For portfolio view, that's totalInvestedAll - totalWithdrawnAll
-      // (where totalInvestedAll is the deals-side number — sum of per-deal
-      // syndicator stakes — same definition as the per-syndicator path).
+      // withdrawn). For portfolio view, use externalCapitalAll if we have it
+      // (matches the per-syndicator definition: external in − withdrawn out).
+      // Falls back to invested-side calc if statement fan-out unavailable.
       netCapitalDeployed: hasSyndicator
         ? fin.netCapitalDeployed
-        : round2((agg.totalInvestedAll || 0) - (agg.totalWithdrawnAll || 0)),
+        : (agg.externalCapitalAll != null
+            ? round2((agg.externalCapitalAll || 0) - (agg.totalWithdrawnAll || 0))
+            : round2((agg.totalInvestedAll || 0) - (agg.totalWithdrawnAll || 0))),
       // Available Cash for portfolio view is sum of per-syndicator available cash.
       currentCashBalance: hasSyndicator ? fin.cashBalance : (agg.totalAvailableCashAll || 0),
       cashBalanceSource: hasSyndicator ? (fin.cashBalanceSource || 'derived') : 'aggregate',
@@ -1956,29 +2071,29 @@ export default async function handler(req, res) {
 
       // Return Metrics (rows 32-48)
       // Per-syndicator: from fin (statement parse + canonical breakdown).
-      // Portfolio view: computed from /syndicators/export aggregate sums.
+      // Portfolio view: computed from /syndicators/export aggregates plus
+      // statement-fan-out totals where available.
+      //
+      // Key denominator change: where the formula needs "capital in," we use
+      // externalCapitalAll (sum of real external deposits across syndicators)
+      // when the fan-out succeeded, NOT totalDepositedAll (which double-counts
+      // reinvestments). Falls back to null/0 when fan-out unavailable.
       netCollections: hasSyndicator
         ? Math.round(fin.netCollections)
         : Math.round((agg.totalCashCollectedAll || 0) - (agg.totalFeesAll || 0)),
       unreturned: hasSyndicator
         ? Math.round(fin.unreturned)
         : Math.round(agg.totalUnreturnedAll || 0),
-      // Gross P&L = Collections - External Capital - Fees. For portfolio view
-      // we don't have a clean "external capital" aggregate (see comment on
-      // Capital Activity section); the previous fallback summed each deal's
-      // pAndL which is structurally wrong for hybrid syndication model. Best
-      // available portfolio-wide approximation: Collections - Fees - sum of
-      // (deal-level net funded) which is what totalDistributedAll/totalWithdrawnAll
-      // measures cumulatively. We use that as a reasonable proxy.
       grossPnL: hasSyndicator
         ? Math.round(totalGrossCollections - sub.externalCapital - totalFees)
-        : Math.round(
-            (agg.totalCashCollectedAll || 0)
-            - (agg.totalFeesAll || 0)
-            - (agg.totalWithdrawnAll || 0)  // proxy for "external capital still in"
-          ),
-      // Total Current Value = withdrawals + cash balance + unreturned. For
-      // portfolio view: same calculation on aggregates.
+        : (agg.externalCapitalAll != null
+            ? Math.round(
+                (agg.totalCashCollectedAll || 0)
+                - (agg.externalCapitalAll || 0)
+                - (agg.totalFeesAll || 0)
+              )
+            : null),
+      // Total Current Value = withdrawals + cash balance + unreturned.
       totalCurrentValue: hasSyndicator
         ? Math.round(fin.totalValue)
         : Math.round(
@@ -1986,36 +2101,39 @@ export default async function handler(req, res) {
             + (agg.totalAvailableCashAll || 0)
             + (agg.totalUnreturnedAll || 0)
           ),
-      // Net Profit = Total Value - External Capital. For portfolio view we use
-      // totalDepositedAll as the "money in" denominator (cleanest available).
-      // Note this includes reinvestments + fee refunds, so it's slightly
-      // generous compared to a true external-only number — but it's the right
-      // economic question for a portfolio: total value vs. total capital pumped in.
+      // Net Profit = Total Value - External Capital. Portfolio uses
+      // externalCapitalAll from the statement fan-out (sum of real external
+      // deposits, NOT totalDeposited which double-counts reinvestments).
       netProfit: hasSyndicator
         ? Math.round(fin.netProfit)
-        : Math.round(
-            (agg.totalWithdrawnAll || 0)
-            + (agg.totalAvailableCashAll || 0)
-            + (agg.totalUnreturnedAll || 0)
-            - (agg.totalDepositedAll || 0)
-          ),
-      // Projected XIRR is a per-syndicator time-weighted return. Not meaningful
-      // in the org-wide aggregate without per-syndicator XIRRs and a weighting
-      // scheme. Surface null for portfolio view; UI can show "—".
-      projectedXIRR: hasSyndicator && flows?.projectedXIRR != null
-        ? round2(flows.projectedXIRR) : null,
-      // Cash-on-Cash Multiple = Total Value / Capital Deposited. For portfolio
-      // view: same calculation on aggregates.
+        : (agg.externalCapitalAll != null
+            ? Math.round(
+                (agg.totalWithdrawnAll || 0)
+                + (agg.totalAvailableCashAll || 0)
+                + (agg.totalUnreturnedAll || 0)
+                - (agg.externalCapitalAll || 0)
+              )
+            : null),
+      // Projected XIRR for portfolio view comes from buildPortfolioFlows —
+      // composes ALL syndicator flow series (real deposits + collections +
+      // fees + projected forward from active deals; defaulted deals get $0).
+      projectedXIRR: hasSyndicator
+        ? (flows?.projectedXIRR != null ? round2(flows.projectedXIRR) : null)
+        : (portfolioFlows?.projectedXIRR != null
+            ? round2(portfolioFlows.projectedXIRR)
+            : null),
+      // Cash-on-Cash Multiple = Total Value / External Capital. Same
+      // denominator change as netProfit.
       cashOnCashMultiple: hasSyndicator
         ? fin.cashOnCash
-        : ((agg.totalDepositedAll || 0) > 0
+        : (agg.externalCapitalAll != null && agg.externalCapitalAll > 0
             ? round2(
                 ((agg.totalWithdrawnAll || 0)
                 + (agg.totalAvailableCashAll || 0)
                 + (agg.totalUnreturnedAll || 0))
-                / (agg.totalDepositedAll || 1)
+                / agg.externalCapitalAll
               )
-            : 0),
+            : null),
 
       // Deal Statistics (rows 51-57)
       dealsInProfit: profitCount,
@@ -2026,27 +2144,29 @@ export default async function handler(req, res) {
 
       // Realized vs Unrealized (rows 59+)
       // Realized Value = Withdrawals + Available Cash (the "cashed out" portion).
-      // For portfolio view: sums across all syndicators.
       realizedValue: hasSyndicator
         ? Math.round(sub.totalWithdrawals + fin.cashBalance)
         : Math.round((agg.totalWithdrawnAll || 0) + (agg.totalAvailableCashAll || 0)),
-      // Realized P&L = Realized Value - Capital In. For portfolio view we use
-      // totalDepositedAll as the capital-in denominator (best available).
+      // Realized P&L = Realized Value - External Capital. Portfolio uses the
+      // real externalCapitalAll from the statement fan-out (NOT totalDeposited
+      // which would double-count reinvestments).
       realizedPnL: hasSyndicator
         ? Math.round(sub.totalWithdrawals + fin.cashBalance - sub.externalCapital)
-        : Math.round(
-            (agg.totalWithdrawnAll || 0)
-            + (agg.totalAvailableCashAll || 0)
-            - (agg.totalDepositedAll || 0)
-          ),
+        : (agg.externalCapitalAll != null
+            ? Math.round(
+                (agg.totalWithdrawnAll || 0)
+                + (agg.totalAvailableCashAll || 0)
+                - (agg.externalCapitalAll || 0)
+              )
+            : null),
       realizedROI: hasSyndicator && sub.externalCapital > 0
         ? round2((sub.totalWithdrawals + fin.cashBalance - sub.externalCapital) / sub.externalCapital)
-        : (!hasSyndicator && (agg.totalDepositedAll || 0) > 0
+        : (!hasSyndicator && agg.externalCapitalAll != null && agg.externalCapitalAll > 0
             ? round2(
                 ((agg.totalWithdrawnAll || 0)
                 + (agg.totalAvailableCashAll || 0)
-                - (agg.totalDepositedAll || 0))
-                / (agg.totalDepositedAll || 1)
+                - (agg.externalCapitalAll || 0))
+                / agg.externalCapitalAll
               )
             : 0),
       unrealizedValue: hasSyndicator
@@ -2145,6 +2265,82 @@ export default async function handler(req, res) {
       });
     } catch (e) { /* continue with empty list */ }
 
+    // ============================================================================
+    // PORTFOLIO-LEVEL STATEMENT PARSE (Phase 2 detour)
+    //
+    // For the Portfolio Overview tab — when no specific syndicator is selected
+    // — we fan out and parse every syndicator's full statement. This unlocks:
+    //
+    //   1. Real `externalCapital` aggregation. /syndicators/export only gives
+    //      `totalDeposited` (which combines external + reinvest + refunds);
+    //      separating them requires the full statement entries' descriptions.
+    //
+    //   2. Real portfolio-wide Projected XIRR. We need each syndicator's full
+    //      cash-flow series (with real dates and real fees) to compose a
+    //      single combined timeline that XIRR can run on.
+    //
+    // Cost: 9 syndicator statements at ~1s each = ~3s with concurrency=3 on
+    // cold cache. Cached at SUBLEDGER TTL (5min) like other syndicator data,
+    // so subsequent loads are instant. Filter to syndicators with >0 deposits
+    // to skip empty contacts that wouldn't contribute anything anyway.
+    //
+    // Skipped if `loadParseStatement()` returns false (parser module missing
+    // — defensive; shouldn't happen in production).
+    // ============================================================================
+    let perSyndicatorParsed = null;        // Map<syndicatorId, parsedStatement>
+    let portfolioStatementDiagnostics = null;
+    if (allSyndicators.length > 0) {
+      try {
+        const ps = await loadParseStatement();
+        if (ps) {
+          // Only fetch for syndicators with non-zero activity. Saves ~half the
+          // calls in practice (some test syndicators have $0 deposits).
+          const candidates = allSyndicators.filter(
+            c => c.totalDeposited > 0 || c.cashCollectedGross > 0 || c.totalInvested > 0
+          );
+          // Bounded concurrency = 3 (matches the deal-fan-out's pacing for
+          // the same rate-limit reason).
+          const stmtUrl = (id) =>
+            `/syndicators/${id}/statement?start_date=2020-01-01&end_date=2030-12-31&format=json&limit=10000`;
+          const results = await pMap(candidates, async (syn) => {
+            const r = await apiFetch(stmtUrl(syn.id));
+            return { syndicatorId: syn.id, name: syn.name, response: r };
+          }, 3);
+          perSyndicatorParsed = new Map();
+          let parseFailures = 0;
+          for (const res of results) {
+            if (res.error) {
+              parseFailures++;
+              continue;
+            }
+            try {
+              const parsed = ps.parse(res.value.response);
+              perSyndicatorParsed.set(res.value.syndicatorId, parsed);
+            } catch (e) {
+              parseFailures++;
+            }
+          }
+          portfolioStatementDiagnostics = {
+            ok: true,
+            syndicatorsParsed: perSyndicatorParsed.size,
+            syndicatorsAttempted: candidates.length,
+            parseFailures,
+          };
+        } else {
+          portfolioStatementDiagnostics = { ok: false, reason: 'parser_module_unavailable' };
+        }
+      } catch (e) {
+        portfolioStatementDiagnostics = {
+          ok: false,
+          reason: 'fanout_threw',
+          error: String(e?.message || e),
+        };
+      }
+    }
+    // ============================================================================
+    // END PORTFOLIO STATEMENT FAN-OUT
+    // ============================================================================
+
     const aggregate = {
       totalInvestedAll: allSyndicators.reduce((s, c) => s + c.totalInvested, 0),
       totalAvailableCashAll: allSyndicators.reduce((s, c) => s + c.availableCash, 0),
@@ -2165,6 +2361,21 @@ export default async function handler(req, res) {
       totalUnreturnedAll: allSyndicators.reduce(
         (s, c) => s + Math.max(0, c.totalInvestedLedger - c.cashCollectedGross), 0
       ),
+      // ----- From per-syndicator statement fan-out (when available) -----
+      // External capital is the cleanest "money in from outside" denominator
+      // for portfolio-wide ROI/profit metrics. Requires statement parsing
+      // (the export endpoint doesn't separate external from reinvest/refund).
+      // Falls back to null when the fan-out wasn't done or failed → the UI
+      // will show "—" instead of an unreliable number.
+      externalCapitalAll: perSyndicatorParsed
+        ? Array.from(perSyndicatorParsed.values()).reduce((s, p) => s + (p.externalCapital || 0), 0)
+        : null,
+      reinvestmentsAll: perSyndicatorParsed
+        ? Array.from(perSyndicatorParsed.values()).reduce((s, p) => s + (p.reinvestments || 0), 0)
+        : null,
+      feeRefundsAll: perSyndicatorParsed
+        ? Array.from(perSyndicatorParsed.values()).reduce((s, p) => s + (p.feeRefunds || 0), 0)
+        : null,
       // Legacy aliases for backwards compatibility with downstream code that
       // expects these names. Both now point at canonical values:
       //   totalRunningBalanceAll → availableCash sum (was details.runningBalance)
@@ -2425,7 +2636,16 @@ export default async function handler(req, res) {
       );
     }
 
-    const summary = buildSummary(dealPerf, sub, derived, fin, synInfo, aggregate, flows);
+    // Compute portfolio-wide flows when no syndicator is selected. Uses the
+    // per-syndicator parsed statements gathered up top, plus deal projections
+    // for each syndicator's active deals. Result feeds the Portfolio Overview
+    // tab's Projected XIRR widget.
+    let portfolioFlows = null;
+    if (!syndicatorId && perSyndicatorParsed && perSyndicatorParsed.size > 0) {
+      portfolioFlows = buildPortfolioFlows(perSyndicatorParsed, deals);
+    }
+
+    const summary = buildSummary(dealPerf, sub, derived, fin, synInfo, aggregate, flows, portfolioFlows);
 
     const vintagesBiz = vintagesSynd.map(v => ({
       vintage: v.vintage,
@@ -2493,6 +2713,12 @@ export default async function handler(req, res) {
         //   - `parsedStatementDiagnostics.reconcile.ok`    → totals match SmartMCA's
         //                                                    /summary block (regression check)
         statement: parsedStatementDiagnostics,
+        // Portfolio statement fan-out (fires when no syndicator selected).
+        // Reports how many syndicators were parsed and any failures so we can
+        // debug if Portfolio Overview shows "—" for externalCapital.
+        portfolioStatement: portfolioStatementDiagnostics,
+        // Portfolio-wide projected XIRR composition (when no syndicator selected).
+        portfolioFlows: portfolioFlows ? portfolioFlows.composition : null,
         // Selected parsed values (only when parser ran successfully) so
         // we can spot-check totals from the live response without needing
         // to add a separate endpoint.

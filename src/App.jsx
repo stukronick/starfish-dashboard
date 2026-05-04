@@ -88,7 +88,7 @@ function OverviewPage({ DATA }) {
     <div>
       {/* Hero KPIs */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginBottom: 32 }}>
-        <KpiCard label="Total Invested" value={fmt(s.totalInvested)} sub={`${s.numDeals} deals · avg ${fmt(s.avgDealSize)}`} />
+        <KpiCard label="External Capital Contributed" value={fmt(s.externalCapital)} sub={`${s.numDeals} deals · avg ${fmt(s.avgDealSize)}`} />
         <KpiCard label="Net Profit (Total Value)" value={fmt(s.netProfit)} accent={clr(s.netProfit)} sub={`Cash-on-Cash ${fmt(s.cashOnCashMultiple, "multiple")}`} />
         <KpiCard label="Projected XIRR" value={fmt(s.projectedXIRR, "xirr")} accent="#FD8E3A" />      </div>
 
