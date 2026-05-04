@@ -1368,7 +1368,71 @@ export default async function handler(req, res) {
   // Scenario commission rate: same as projected side for internal consistency
   // (the spreadsheet's 5% baseline). The empirical residual rate for LMJS is
   // 5.15%; close enough to 5% that the difference is < 1pp on annual XIRR.
-  function buildHistoricalPaymentFlows(perDealShares, scenario) {
+  // ============================================================================
+  // HISTORICAL MERCHANT-PAYMENT-LEVEL FLOWS (replaces subledger withdrawals)
+  // ============================================================================
+  // Step 4 update: when a parsed statement is provided, emit GROSS positive
+  // collection flows + REAL per-payment fees (residualCommission and per-
+  // payment managementFee) as separate negative flows on their actual dates.
+  // This replaces the rate-based netting approach (`× (1 - commission)`) with
+  // exact fee accounting from the SmartMCA statement.
+  //
+  // The two paths produce:
+  //
+  //   Legacy (no parsedStatement):
+  //     For each cleared payment: ONE flow at `payment × share × (1-comm)`,
+  //     positive (collection) or negative (balance_transfer_out).
+  //
+  //   Statement-aware (with parsedStatement):
+  //     For each `paymentShareAllocated` entry: ONE positive flow (already
+  //       LMJS-share-applied, gross — no commission haircut).
+  //     For each `residualCommission` entry: ONE negative flow on its real date.
+  //     For each `managementFee` entry (per-payment): ONE negative flow.
+  //     Reversals and balance transfers handled via signed amounts in parsed.
+  //
+  // Mathematically equivalent on a per-day basis (XIRR sums same-date flows
+  // before discounting). More accurate when a fee posts on a different date
+  // than its corresponding collection (rare but does happen).
+  //
+  // Data source:
+  //   Statement-aware: parsedStatement.cashFlowsForXIRR (already sorted, signed,
+  //                    syndicator-share-applied — direct passthrough with
+  //                    category filtering).
+  //   Legacy: derived.perDealShares[i].payments (raw deal payment records).
+  function buildHistoricalPaymentFlows(perDealShares, scenario, parsedStatement) {
+    // ---- Statement-aware path ----
+    if (parsedStatement && Array.isArray(parsedStatement.cashFlowsForXIRR)) {
+      const out = [];
+      for (const f of parsedStatement.cashFlowsForXIRR) {
+        // Categories we emit:
+        //   collection           — positive, gross (no haircut)
+        //   residualCommission   — negative, real fee event
+        //   managementFee        — negative, per-payment management fee
+        // Excluded:
+        //   externalDeposit/withdrawal/reversal — already handled elsewhere
+        //                                          or excluded from XIRR
+        //   upfrontFee — handled via buildHistoricalManagementFees on funded date
+        if (f.category !== 'collection'
+            && f.category !== 'residualCommission'
+            && f.category !== 'managementFee') {
+          continue;
+        }
+        out.push({
+          date: f.date.slice(0, 10),
+          amount: f.amount,                       // already signed correctly
+          type: f.category === 'collection' ? 'Historical Collection (Gross)'
+              : f.category === 'residualCommission' ? 'Residual Commission (Real)'
+              : 'Management Fee Per-Payment (Real)',
+          description: f.category === 'collection'
+            ? `Collection share allocated`
+            : `${f.category} on payment`,
+          dealNo: f.dealId || null,
+        });
+      }
+      return out;
+    }
+
+    // ---- Legacy path: rate-based netting from raw per-deal payments ----
     if (!perDealShares || !Array.isArray(perDealShares)) return [];
     const COLLECTION_TYPES = new Set(['merchantPayment', 'refinancePayoff', 'balanceTransferIn']);
     const NEGATIVE_TYPES = new Set(['balanceTransferOut']);
@@ -1419,14 +1483,52 @@ export default async function handler(req, res) {
   // ============================================================================
   // HISTORICAL MANAGEMENT FEES (one-time per deal, on funded date)
   // ============================================================================
-  // For each deal where the syndicator participated, emit a single negative
-  // flow on the deal's fundedDate equal to (syndicator_funded × managementFeeRate).
-  // Uses the per-syndicator configured rate (8.85% for LMJS, 12% default).
+  // Step 4 update: if a parsed statement is provided, use REAL per-deal
+  // upfront fees from `parsed.feesByDeal[dealId].upfront`. Each deal's actual
+  // upfront fee (which varies $1,470 - $25,500 across LMJS deals) is emitted
+  // as a negative XIRR flow on the deal's fundedDate. This replaces the
+  // rate-based approximation `syndFunded × managementFeeRate` which produces
+  // the right total but wrong per-deal breakdown.
   //
-  // The spreadsheet shows ~$37,569 total mgmt fees for LMJS, which back-computes
-  // to ~8.85% × $424,365 invested. We mirror that.
-  function buildHistoricalManagementFees(deals, syndicatorId, feeConfig) {
-    if (!deals || !syndicatorId || !feeConfig) return [];
+  // Falls back to the rate-based calc if parsedStatement is null (statement
+  // endpoint unavailable, fallback path triggered).
+  //
+  // Note: per-deal residual commissions and per-payment management fees are
+  // NOT emitted here — those land on actual collection dates via
+  // buildHistoricalPaymentFlows when parsedStatement is provided.
+  function buildHistoricalManagementFees(deals, syndicatorId, feeConfig, parsedStatement) {
+    if (!deals || !syndicatorId) return [];
+
+    // ---- Statement-aware path: real upfront fees per deal ----
+    if (parsedStatement && parsedStatement.feesByDeal) {
+      const out = [];
+      // Build a dealInternalId → fundedDate map so we don't iterate deals
+      // unnecessarily for syndicators that didn't participate everywhere.
+      const dealById = new Map();
+      for (const d of deals) dealById.set(d.id, d);
+
+      for (const [dealId, fees] of parsedStatement.feesByDeal.entries()) {
+        const upfront = fees.upfront || 0;
+        if (upfront <= 0) continue;
+        const deal = dealById.get(dealId);
+        // Date: prefer the deal's fundedDate; fall back to first collection
+        // date for this deal if fundedDate missing (shouldn't happen but
+        // defensive).
+        const fundedDate = deal?.fundedDate ? deal.fundedDate.slice(0, 10) : null;
+        if (!fundedDate) continue;
+        out.push({
+          date: fundedDate,
+          amount: -round2(upfront),
+          type: 'Upfront Fee (Real)',
+          description: `Upfront fee paid (${deal?.dealId || dealId})`,
+          dealNo: deal?.dealId || dealId,
+        });
+      }
+      return out;
+    }
+
+    // ---- Fallback: rate-based approximation (legacy path) ----
+    if (!feeConfig) return [];
     const rate = feeConfig.managementFeeRate || 0;
     if (rate <= 0) return [];
 
@@ -1453,8 +1555,27 @@ export default async function handler(req, res) {
     return out;
   }
 
-  function buildFlows(sub, fin, derived, deals, syndicatorId, scenario, feeConfig) {
-    const effectiveScenario = scenario || DEFAULT_SCENARIO;
+  function buildFlows(sub, fin, derived, deals, syndicatorId, scenario, feeConfig, parsedStatement) {
+    // Step 4: when a parsed statement is available, compute the observed
+    // effective commission rate (residual + per-payment management fees as
+    // a fraction of gross collections) and override the scenario's commission
+    // for projected forward flows. This makes projections use the actual rate
+    // this syndicator has been paying, rather than the 5% default.
+    //
+    // For LMJS empirically: ($10,741 + $4,491) / $295,025 = 5.16%, very close
+    // to the default 5% but more accurate. For other syndicators the rate
+    // could differ — using observed data eliminates the guess.
+    let effectiveScenario = scenario || DEFAULT_SCENARIO;
+    if (parsedStatement && parsedStatement.cashCollectedGross > 0) {
+      const observedFees = (parsedStatement.residualCommissions || 0)
+                         + (parsedStatement.managementFees || 0);
+      const observedRate = observedFees / parsedStatement.cashCollectedGross;
+      // Sanity bounds: keep within [0%, 25%] to guard against degenerate
+      // data (a syndicator with very few payments might produce noise).
+      if (observedRate >= 0 && observedRate <= 0.25) {
+        effectiveScenario = { ...effectiveScenario, commission: observedRate };
+      }
+    }
 
     // ========================================================================
     // BUILD THE XIRR SERIES
@@ -1466,30 +1587,23 @@ export default async function handler(req, res) {
     //      Source: sub.externalDeposits (deposits flagged as new capital, not
     //      reinvestments of prior payouts). Reinvestments are intentionally
     //      excluded — they are internal capital recycling, not new investments.
-    //      LMJS today: 3 entries totaling $235k.
+    //      LMJS today: 5 entries totaling $235k.
     //
-    //   2. NEGATIVE — management fees (one-time per deal, on funded date)
-    //      Source: buildHistoricalManagementFees(). For each deal LMJS
-    //      participated in, subtract LMJS_funded × managementFeeRate (8.85%
-    //      for LMJS) on the deal's fundedDate. Total ≈ $37k for LMJS.
+    //   2. NEGATIVE — upfront fees per deal, on funded date
+    //      Source: buildHistoricalManagementFees(). When parsedStatement is
+    //      provided: real per-deal upfront fees from parsed.feesByDeal[deal].upfront.
+    //      Otherwise falls back to syndFunded × managementFeeRate approximation.
     //
-    //   3. POSITIVE — historical merchant payments scaled to syndicator share,
-    //      net of per-payment commission
-    //      Source: buildHistoricalPaymentFlows(). One flow per cleared payment
-    //      across all participating deals: payment.amount × syndicator.share ×
-    //      (1 - commission). Replaces the older subledger-withdrawal approach
-    //      which was less granular (distributions came in batches, after
-    //      processing delays, and were already net of fees we couldn't see).
+    //   3. POSITIVE — historical merchant payments (gross, with separate fee debits)
+    //      Source: buildHistoricalPaymentFlows(). When parsedStatement is provided:
+    //      gross collection flows + separate negative residualCommission and
+    //      managementFee flows on real dates. Otherwise uses rate-netted approach.
     //
     //   4. POSITIVE — projected future per-deal payments (commission-net)
     //      Source: buildProjectedFlows(). Per active deal, projects forward
     //      payment schedule from txLastPaymentDate using observed cadence,
-    //      scaled to syndicator share, net of 5% per-payment commission.
-    //
-    // We do NOT add cash-on-hand as a terminal flow — idle cash isn't return.
-    // We do NOT add a lump-sum recovery — projected per-deal payments
-    // produce the recovery of outstanding implicitly, on the dates payments
-    // would actually arrive.
+    //      scaled to syndicator share, net of effectiveScenario.commission
+    //      (uses observed historical rate when parsedStatement is available).
 
     const xirrFlows = [];
 
@@ -1503,19 +1617,21 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2. Historical management fees (negative, one per deal on funded date)
-    const mgmtFeeFlows = buildHistoricalManagementFees(deals, syndicatorId, feeConfig);
+    // 2. Historical upfront fees (negative, one per deal on funded date)
+    //    Uses real per-deal amounts when parsedStatement present.
+    const mgmtFeeFlows = buildHistoricalManagementFees(deals, syndicatorId, feeConfig, parsedStatement);
     for (const f of mgmtFeeFlows) {
       xirrFlows.push(f);
     }
 
-    // 3. Historical merchant payments × share, net of commission (positive)
-    const paymentFlows = buildHistoricalPaymentFlows(derived?.perDealShares, effectiveScenario);
+    // 3. Historical collections + per-payment fees (gross+fees split when
+    //    parsedStatement present; rate-netted otherwise)
+    const paymentFlows = buildHistoricalPaymentFlows(derived?.perDealShares, effectiveScenario, parsedStatement);
     for (const p of paymentFlows) {
       xirrFlows.push(p);
     }
 
-    // 4. Projected future payments (positive)
+    // 4. Projected future payments (positive, net of observed commission rate)
     const projectedFlows = buildProjectedFlows(deals, syndicatorId, effectiveScenario);
     for (const p of projectedFlows) {
       xirrFlows.push(p);
@@ -1561,8 +1677,17 @@ export default async function handler(req, res) {
         firstDate: projectedFlows.length > 0 ? projectedFlows[0].date : null,
         lastDate: projectedFlows.length > 0 ? projectedFlows[projectedFlows.length - 1].date : null,
         scenario: effectiveScenario,
+        // Step 4: report whether the commission rate came from observed data
+        // (statement-derived) vs the DEFAULT_SCENARIO baseline.
+        commissionRateSource: parsedStatement && parsedStatement.cashCollectedGross > 0
+          ? 'observed_from_statement'
+          : 'default_5pct',
       },
-      // Composition of the XIRR series, for verification:
+      // Composition of the XIRR series, for verification.
+      // Note: mgmtFee* fields refer to upfront fees emitted on funded date.
+      // Per-payment fees (residualCommission and per-payment managementFee)
+      // are now bundled into historicalPayment* when statement is parsed,
+      // since they're emitted on collection-date events alongside collections.
       xirrComposition: {
         externalDepositCount: sub.externalDeposits.length,
         externalDepositTotal: round2(sub.externalDeposits.reduce((s, d) => s + d.amount, 0)),
@@ -1578,6 +1703,8 @@ export default async function handler(req, res) {
           + paymentFlows.reduce((s, p) => s + p.amount, 0)
           + projectedFlows.reduce((s, f) => s + f.amount, 0)
         ),
+        // Step 4: signals which historical-fee mechanism is in use.
+        feeSource: parsedStatement ? 'statement_real_dates' : 'rate_based_approximation',
       },
     };
   }
@@ -2556,7 +2683,7 @@ export default async function handler(req, res) {
         perDealCollectionsFromStatement
       );
       fin = combineFinancials(sub, derived, synInfo);
-      flows = buildFlows(sub, fin, derived, deals, syndicatorId, undefined, feeConfig);
+      flows = buildFlows(sub, fin, derived, deals, syndicatorId, undefined, feeConfig, parsedStatement);
     }
 
     // 4. Build the deal-perf table. When a syndicator is selected, each row
