@@ -190,6 +190,7 @@ export function parseStatement(statementResponse) {
   const collectionsByDealGross = new Map(); // dealId → gross collections (credit only)
   const feesByDeal = new Map();        // dealId → { residual, management, upfront }
   const investmentsByDeal = new Map(); // dealId → total invested
+  const investmentsByDate = new Map(); // dateStr → total invested on that date
 
   // Cash-flow series for XIRR. Each entry: { date, amount, category, dealId }.
   // Sign convention: NEGATIVE = cash out from syndicator's perspective
@@ -243,6 +244,11 @@ export function parseStatement(statementResponse) {
         totalInvested += abs;         // amt < 0
         const cur = investmentsByDeal.get(c.dealId) || 0;
         investmentsByDeal.set(c.dealId, cur + abs);
+        // Track per-date for the cash-flow chart adapter.
+        const dKey = (c.date || '').slice(0, 10);
+        if (dKey) {
+          investmentsByDate.set(dKey, (investmentsByDate.get(dKey) || 0) + abs);
+        }
         // Not a true XIRR flow — see comment above. Investment is balance
         // sheet reallocation. The matching collections will be the inflows.
         break;
@@ -386,6 +392,7 @@ export function parseStatement(statementResponse) {
     collectionsByDealGross,      // Map<dealId, gross collections>
     feesByDeal,                  // Map<dealId, {residual, management, upfront}>
     investmentsByDeal,           // Map<dealId, total invested>
+    investmentsByDate,           // Map<dateStr, total invested on date>  [adapter use]
 
     // ---- Cash-flow series for XIRR ----
     // Sign: negative = capital out (deposits, fees), positive = returns in
@@ -414,4 +421,142 @@ export function reconcileWithSummary(parsed, summaryBlock) {
   // Allow a small floating-point tolerance.
   const ok = Object.values(deltas).every(d => Math.abs(d) < 0.01);
   return { ok, deltas };
+}
+
+// ---- Adapter: produce the legacy parseSubledger shape from parsed statement ----
+//
+// During Phase 2 Step 3 we drop the /accounting/reports/subledger fetch and
+// derive its outputs from the statement parser. Downstream code (combineFinancials,
+// buildFlows, buildSummary, _debug.subledger) consumes the legacy shape, so this
+// adapter keeps that contract while changing the source.
+//
+// Field-by-field mapping:
+//   externalCapital, reinvestedReturns, feeRefunds, totalDeposits → directly from parsed
+//   totalWithdrawals, totalInvestmentsLedger                       → directly from parsed
+//   mgmtFeesLedger, residualCommissionsLedger                      → see note below
+//   externalDeposits[], withdrawalEntries[], feeEntries[]          → derived from cashFlowsForXIRR
+//   flowsByDate, dailyFlows                                        → aggregated from cashFlowsForXIRR
+//   earliestDepositDate                                            → min(date) over external deposits
+//   entryCount, totalEntryCount                                    → parsed.transactionCount
+//
+// On the fee fields: legacy parseSubledger combined ALL per-payment fees into
+// `residualCommissionsLedger` (with an explicit "misnomer" comment). For Step 3
+// we preserve that behavior — keep the combined value in `residualCommissionsLedger`
+// for downstream compat. Step 5 (UI fee breakdown) will plumb the proper split.
+export function statementToSubledgerShape(parsed) {
+  if (!parsed) {
+    return {
+      externalCapital: 0, reinvestedReturns: 0, feeRefunds: 0,
+      totalDeposits: 0, totalWithdrawals: 0, totalInvestmentsLedger: 0,
+      mgmtFeesLedger: 0, residualCommissionsLedger: 0,
+      mgmtFeeCount: 0, residualCount: 0, hasLedgerFees: false,
+      earliestDepositDate: null,
+      flowsByDate: {}, dailyFlows: {},
+      externalDeposits: [], withdrawalEntries: [], feeEntries: [],
+      entryCount: 0, totalEntryCount: 0,
+    };
+  }
+
+  // Per-entry arrays for buildFlows.
+  // Pull dates from the cashFlowsForXIRR series — it already has them
+  // categorised and sorted. We just need to filter by category.
+  const externalDeposits  = [];
+  const withdrawalEntries = [];
+  const feeEntries        = [];
+
+  // flowsByDate: cleaner XIRR-style aggregation (negative = cash in, positive = out).
+  // Legacy semantics from parseSubledger:
+  //   deposits:   flowsByDate[d] -= credit  (negative)
+  //   withdrawals:flowsByDate[d] += debit   (positive)
+  // Investments are NOT in flowsByDate (they're balance-sheet only, not cash flows).
+  // We replicate this exactly.
+  const flowsByDate = {};
+  // dailyFlows: cash-flow chart format. Three counters per date.
+  const dailyFlows  = {};
+
+  let earliestDepositDate = null;
+
+  // Walk the cashFlowsForXIRR series. Each entry has {date, amount, category, dealId}.
+  // amount sign: negative = capital out (deposit/fee from syndicator), positive = in.
+  // We need to map back to the legacy (positive) totals + sign-conventional flows.
+  for (const f of parsed.cashFlowsForXIRR) {
+    const d = (f.date || '').slice(0, 10);
+    const absAmt = Math.abs(f.amount);
+
+    if (!dailyFlows[d]) dailyFlows[d] = { deposits: 0, withdrawals: 0, investments: 0 };
+
+    switch (f.category) {
+      case 'externalDeposit':
+        // f.amount is NEGATIVE (cash from syndicator's pocket → out)
+        externalDeposits.push({ date: d, amount: r2(absAmt) });
+        if (!earliestDepositDate || d < earliestDepositDate) earliestDepositDate = d;
+        flowsByDate[d] = (flowsByDate[d] || 0) - absAmt;  // negative = in
+        dailyFlows[d].deposits += absAmt;
+        break;
+
+      case 'withdrawal':
+        // f.amount is POSITIVE (cash returned to syndicator)
+        withdrawalEntries.push({ date: d, amount: r2(absAmt) });
+        flowsByDate[d] = (flowsByDate[d] || 0) + absAmt;  // positive = out (back to user)
+        dailyFlows[d].withdrawals += absAmt;
+        break;
+
+      case 'residualCommission':
+      case 'managementFee':
+      case 'upfrontFee':
+        // Fees: per-entry detail for XIRR. Type label matches legacy convention.
+        feeEntries.push({
+          date: d,
+          amount: r2(absAmt),
+          type: f.category === 'upfrontFee' ? 'Management Fee Paid (One Time)' : 'Per-Transaction Fee',
+        });
+        // Fees do NOT go into flowsByDate (legacy didn't include them) but
+        // they DO go into the XIRR engine via the dedicated feeEntries array.
+        break;
+
+      // collection, reversal, reinvestment categories also appear in
+      // cashFlowsForXIRR — they shouldn't affect the legacy shape's daily
+      // aggregates. (Reinvestments are excluded by parseStatement; collections
+      // & reversals are handled by other code paths.)
+      default:
+        break;
+    }
+  }
+
+  // Investments aren't in cashFlowsForXIRR (they're not cash flows).
+  // The legacy parser populated dailyFlows[d].investments for the cash-flow
+  // chart, so we replicate that from investmentsByDate. Per-date detail is
+  // accurate (parsed entry-by-entry).
+  if (parsed.investmentsByDate && typeof parsed.investmentsByDate.forEach === 'function') {
+    parsed.investmentsByDate.forEach((amt, d) => {
+      if (!dailyFlows[d]) dailyFlows[d] = { deposits: 0, withdrawals: 0, investments: 0 };
+      dailyFlows[d].investments += amt;
+    });
+  }
+
+  return {
+    externalCapital:        parsed.externalCapital,
+    reinvestedReturns:      parsed.reinvestments,
+    feeRefunds:             parsed.feeRefunds,
+    totalDeposits:          parsed.totalDeposited,
+    totalWithdrawals:       parsed.totalWithdrawn,
+    totalInvestmentsLedger: parsed.totalInvestedLedger,
+    // Fee fields — preserve legacy combined-residual semantics for Step 3 compat.
+    // The "residualCommissionsLedger" name is a known misnomer: it's the SUM of
+    // ALL per-payment fees (residual commissions + per-payment management fees).
+    // Step 5 will replace this with a proper split when the UI is updated.
+    mgmtFeesLedger:            r2(parsed.upfrontFees),
+    residualCommissionsLedger: r2(parsed.residualCommissions + parsed.managementFees),
+    mgmtFeeCount:              0, // we don't track counts in parseStatement; leave 0 (cosmetic only)
+    residualCount:             0,
+    hasLedgerFees:             (parsed.totalFeesPaid || 0) > 0,
+    earliestDepositDate,
+    flowsByDate,
+    dailyFlows,
+    externalDeposits,
+    withdrawalEntries,
+    feeEntries,
+    entryCount:               parsed.transactionCount,
+    totalEntryCount:          parsed.transactionCount,
+  };
 }

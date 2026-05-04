@@ -114,15 +114,21 @@ async function initKv() {
   }
 }
 
-// Phase 2: Statement parser. Loaded dynamically so the module continues to
-// load if the file is missing on a partial deploy. Once Phase 2 stabilises
-// (Step 3 — when we drop subledger), this can become a static import.
+// Phase 2 Step 3: Statement parser is now the PRIMARY source for syndicator
+// cash-flow data. We dropped the /accounting/reports/subledger/ fetch and
+// derive the legacy sub-shape from the statement via statementToSubledgerShape.
+// Loaded dynamically so the module continues to load if the file is missing
+// on a partial deploy. Once Phase 2 stabilises, this can become a static import.
 let _parseStatement = null;
 async function loadParseStatement() {
   if (_parseStatement !== null) return _parseStatement;
   try {
     const mod = await import('./parseStatement.js');
-    _parseStatement = { parse: mod.parseStatement, reconcile: mod.reconcileWithSummary };
+    _parseStatement = {
+      parse:     mod.parseStatement,
+      reconcile: mod.reconcileWithSummary,
+      toSub:     mod.statementToSubledgerShape,
+    };
   } catch (err) {
     _parseStatement = false;
   }
@@ -749,7 +755,11 @@ export default async function handler(req, res) {
   //    in SYNDICATOR_FEE_CONFIG will produce an exact spreadsheet match
   //    when configured correctly.
   // ==========================================================================
-  async function aggregateSyndicatorMetrics(deals, syndicatorId, feeConfig, sub, fetchPayments) {
+  async function aggregateSyndicatorMetrics(
+    deals, syndicatorId, feeConfig, sub,
+    fetchPayments,
+    perDealCollectionsFromStatement = null  // Phase 2 Step 3: Map<dealId, payments[]>
+  ) {
     if (!syndicatorId) return null;
 
     let syndInvested = 0;       // sum of LMJS's per-deal fundedAmount
@@ -791,7 +801,37 @@ export default async function handler(req, res) {
     let balanceTransfersOut = 0;
     let paymentRecordCount = 0;
 
-    if (fetchPayments) {
+    if (perDealCollectionsFromStatement) {
+      // Phase 2 Step 3: collections already provided by parseStatement.
+      // Synthesized payments are LMJS-share-applied, so we set sharePct=1.0
+      // on the perDealShares so downstream multiplication is a no-op.
+      // This replaces N per-deal /deals/{id}/payments fetches with one
+      // already-fetched data slice.
+      for (let i = 0; i < perDealShares.length; i++) {
+        const { dealInternalId } = perDealShares[i];
+        const payments = perDealCollectionsFromStatement.get(dealInternalId) || [];
+        perDealShares[i].payments = payments;
+        // Override sharePct to 1.0 so buildHistoricalPaymentFlows et al.
+        // don't double-apply the percentage. The statement entries are
+        // already share-applied.
+        perDealShares[i].sharePct = 1.0;
+
+        for (const p of payments) {
+          paymentRecordCount++;
+          // All synthesized entries are merchantPayment type with positive
+          // direction. Statement endpoint doesn't distinguish refi/balance-
+          // transfer types; everything appears as paymentShareAllocated.
+          // We bucket them all into merchantPayments for the breakdown
+          // (downstream code only sums collections, doesn't act on the
+          // distinction). Refi/balance-transfer breakouts are dropped from
+          // the dashboard for now — matches what the statement endpoint
+          // exposes. If needed in future, can reconstruct from
+          // paymentShareAllocated descriptions like "refi_incoming" or
+          // "balance_transfer_in/out".
+          merchantPayments += p.amount;
+        }
+      }
+    } else if (fetchPayments) {
       // Bounded-concurrency per-deal payment fetches. Each retries up to 3x
       // in cachedApiFetch; failures here mean even retries didn't recover.
       // Concurrency=3 (matching the deal-detail fan-out) for the same rate-
@@ -2049,112 +2089,153 @@ export default async function handler(req, res) {
       feeConfig = getFeeConfig(syndicatorId);
 
       // ============================================================
-      // PHASE 2 STEP 2: Parallel statement fetch + parse, diagnostics-only.
-      //   We fetch both subledger (legacy) and statement (new) endpoints
-      //   in parallel, parse both, and compute diffs in the _debug block.
-      //   No production logic switches over yet — that's Step 3, after we
-      //   verify the parsed statement values match the legacy values for
-      //   real LMJS/Jacob data.
+      // PHASE 2 STEP 3: Statement endpoint is now the PRIMARY source.
       //
-      //   Statement endpoint accepts limit=10000 and returns all entries
-      //   in one round-trip (~1s for LMJS at 1814 entries). Same TTL as
-      //   subledger (5min) since both reflect transaction-level data.
+      // Single fetch replaces:
+      //   - /accounting/reports/subledger/syndicator/{id} (legacy)
+      //   - /deals/{id}/payments × N (per-deal payment fetches)
       //
-      //   Date range: hardcoded broad window (2020 → 2030) to ensure full
-      //   history. No reason to scope tighter — server returns everything
-      //   in scope and our cache absorbs the cost.
+      // Statement returns one row per LMJS transaction with full date/amount/
+      // category/dealId detail. We:
+      //   1. Parse it into structured aggregates (parseStatement)
+      //   2. Adapt to legacy `sub` shape (statementToSubledgerShape)
+      //   3. Synthesize per-deal payment lists from parsed.cashFlowsForXIRR
+      //      so buildHistoricalPaymentFlows / buildCollectionCurves keep
+      //      working with no changes
+      //
+      // Fallback: if the statement endpoint fails (unlikely but possible),
+      // fall back to the legacy subledger fetch. The dashboard still loads
+      // with degraded data.
+      //
+      // Date range: hardcoded broad window (2020 → 2030) to ensure full
+      // history. Statement endpoint accepts limit=10000 → one round-trip
+      // (~1s for LMJS at 1814 entries). Cached at SUBLEDGER TTL (5 min).
       // ============================================================
       const statementUrl = `/syndicators/${syndicatorId}/statement?start_date=2020-01-01&end_date=2030-12-31&format=json&limit=10000`;
-      const [subResult, stmtResult] = await Promise.allSettled([
-        apiFetch(`/accounting/reports/subledger/syndicator/${syndicatorId}?limit=10000`),
-        apiFetch(statementUrl),
-      ]);
-
-      // ---- Subledger (existing path) ----
-      if (subResult.status === 'fulfilled') {
-        const subResp = subResult.value;
-        const entries = subResp.data?.entries
-          || subResp.data?.data
-          || (Array.isArray(subResp.data) ? subResp.data : []);
-        sub = parseSubledger(entries);
-      } else {
-        // Fail open: subledger unavailable -> zero-out cash-flow side, keep deal side.
-        sub = {
-          externalCapital: 0, reinvestedReturns: 0, feeRefunds: 0,
-          totalDeposits: 0, totalWithdrawals: 0, totalInvestmentsLedger: 0,
-          mgmtFeesLedger: 0, residualCommissionsLedger: 0,
-          mgmtFeeCount: 0, residualCount: 0, hasLedgerFees: false,
-          earliestDepositDate: null,
-          flowsByDate: {}, dailyFlows: {},
-          externalDeposits: [], withdrawalEntries: [], feeEntries: [],
-          entryCount: 0, totalEntryCount: 0,
+      let stmtResp = null;
+      try {
+        stmtResp = await apiFetch(statementUrl);
+      } catch (e) {
+        // Statement fetch failed — capture and fall through to legacy path.
+        parsedStatementDiagnostics = {
+          ok: false,
+          reason: 'statement_fetch_failed',
+          error: String(e?.message || e),
         };
       }
 
-      // ---- Statement (new, diagnostics-only) ----
-      // Wrapped so any failure here (parser bug, endpoint hiccup, missing
-      // import) cannot break the response. We surface the error in
-      // _debug.statement so we'll see it in the dashboard.
-      try {
-        const ps = await loadParseStatement();
-        if (ps && stmtResult.status === 'fulfilled') {
-          const parsed = ps.parse(stmtResult.value);
-          const summaryBlock = stmtResult.value?.data?.summary || null;
+      if (stmtResp) {
+        try {
+          const ps = await loadParseStatement();
+          if (!ps) throw new Error('parseStatement module unavailable');
+          const parsed = ps.parse(stmtResp);
+          const summaryBlock = stmtResp?.data?.summary || null;
           const reconcile = ps.reconcile(parsed, summaryBlock);
-          // Compute diffs vs the legacy paths (subledger for cash flows,
-          // synInfo from /syndicators/export for fees and balance).
-          const diffs = {};
-          if (sub) {
-            diffs.totalDepositedDelta    = round2((parsed.totalDeposited || 0)     - (sub.totalDeposits || 0));
-            diffs.totalWithdrawnDelta    = round2((parsed.totalWithdrawn || 0)     - (sub.totalWithdrawals || 0));
-            diffs.totalInvestedDelta     = round2((parsed.totalInvestedLedger||0)  - (sub.totalInvestmentsLedger || 0));
-            diffs.externalCapitalDelta   = round2((parsed.externalCapital || 0)    - (sub.externalCapital || 0));
-            diffs.reinvestmentsDelta     = round2((parsed.reinvestments || 0)      - (sub.reinvestedReturns || 0));
-            diffs.feeRefundsDelta        = round2((parsed.feeRefunds || 0)         - (sub.feeRefunds || 0));
-          }
-          if (synInfo) {
-            diffs.cashBalanceDelta       = round2((parsed.closingBalance || 0)     - (synInfo.availableCash || 0));
-            diffs.cashCollectedDelta     = round2((parsed.cashCollectedGross || 0) - (synInfo.cashCollectedGross || 0));
-            diffs.totalFeesDelta         = round2((parsed.totalFeesNetOfReversals||0) - (synInfo.managementFees || 0));
-          }
           parsedStatement = parsed;
           parsedStatementDiagnostics = {
             ok: true,
             transactionCount: parsed.transactionCount,
-            reconcile,                 // {ok, deltas} from reconcileWithSummary
-            diffs,                     // deltas vs legacy data sources
+            reconcile,
             unknownEntryCount: parsed.unknownEntryCount,
+            primarySource: 'statement',
           };
-        } else if (stmtResult.status === 'rejected') {
+          // Derive legacy `sub` shape from the parsed statement.
+          sub = ps.toSub(parsed);
+        } catch (e) {
+          // Parser threw — capture diagnostic and force legacy fallback.
           parsedStatementDiagnostics = {
             ok: false,
-            reason: 'fetch_failed',
-            error: String(stmtResult.reason?.message || stmtResult.reason),
+            reason: 'parse_threw',
+            error: String(e?.message || e),
           };
-        } else if (!ps) {
-          parsedStatementDiagnostics = {
-            ok: false,
-            reason: 'parser_module_unavailable',
-          };
+          stmtResp = null; // trigger legacy fallback below
         }
-      } catch (e) {
-        parsedStatementDiagnostics = {
-          ok: false,
-          reason: 'parse_threw',
-          error: String(e.message || e),
-        };
+      }
+
+      // Legacy fallback: if statement path failed, fetch subledger directly.
+      // This keeps the dashboard alive even if the new endpoint has hiccups.
+      if (!sub) {
+        try {
+          const subResp = await apiFetch(
+            `/accounting/reports/subledger/syndicator/${syndicatorId}?limit=10000`
+          );
+          const entries = subResp.data?.entries
+            || subResp.data?.data
+            || (Array.isArray(subResp.data) ? subResp.data : []);
+          sub = parseSubledger(entries);
+          if (parsedStatementDiagnostics) {
+            parsedStatementDiagnostics.fallback = 'subledger_legacy';
+          }
+        } catch (e) {
+          // Both paths failed: zero-out cash-flow side, keep deal side functional.
+          sub = {
+            externalCapital: 0, reinvestedReturns: 0, feeRefunds: 0,
+            totalDeposits: 0, totalWithdrawals: 0, totalInvestmentsLedger: 0,
+            mgmtFeesLedger: 0, residualCommissionsLedger: 0,
+            mgmtFeeCount: 0, residualCount: 0, hasLedgerFees: false,
+            earliestDepositDate: null,
+            flowsByDate: {}, dailyFlows: {},
+            externalDeposits: [], withdrawalEntries: [], feeEntries: [],
+            entryCount: 0, totalEntryCount: 0,
+          };
+          if (parsedStatementDiagnostics) {
+            parsedStatementDiagnostics.fallback = 'failed_both';
+          }
+        }
       }
       // ============================================================
-      // END PHASE 2 STEP 2
+      // END PHASE 2 STEP 3 fetch+parse
       // ============================================================
 
-      // Aggregate per-deal syndication data + per-deal payment breakdown.
-      // The fetchPayments callback wraps apiFetch so the cache layer
-      // dedupes repeat requests across the page-fan-out.
-      const fetchPayments = (dealInternalId) =>
-        apiFetch(`/deals/${dealInternalId}/payments?limit=200`);
+      // Aggregate per-deal syndication data + per-deal collection breakdown.
+      //
+      // Step 3 change: when we have parsed statement data, synthesize per-deal
+      // payment lists from parsed.cashFlowsForXIRR (filtered to category ===
+      // 'collection'). This replaces N per-deal /deals/{id}/payments fetches
+      // with one slice of already-fetched data.
+      //
+      // The synthesized payments are LMJS-share-applied (since statement
+      // entries are already per-syndicator), so sharePct is set to 1.0
+      // downstream — buildHistoricalPaymentFlows then multiplies by 1.0 = no-op.
+      //
+      // Fallback: if parsedStatement is unavailable, still use the per-deal
+      // payment fetches (legacy path) so the dashboard works.
+      let fetchPaymentsCallback = null;
+      let perDealCollectionsFromStatement = null;
+      if (parsedStatement) {
+        // Group cashFlowsForXIRR collections by dealId → list of {date, amount}.
+        // Each entry already represents LMJS's share, sharePct-applied.
+        perDealCollectionsFromStatement = new Map();
+        for (const f of parsedStatement.cashFlowsForXIRR) {
+          if (f.category !== 'collection' || !f.dealId) continue;
+          if (!perDealCollectionsFromStatement.has(f.dealId)) {
+            perDealCollectionsFromStatement.set(f.dealId, []);
+          }
+          // Synthesize a payment-shaped object so buildHistoricalPaymentFlows
+          // and buildCollectionCurves accept it without modification. amount is
+          // POSITIVE (cashFlowsForXIRR signs collections as positive). status
+          // is 'cleared' since the statement endpoint only returns posted entries.
+          perDealCollectionsFromStatement.get(f.dealId).push({
+            type: 'merchantPayment',  // we lose refi/balance-transfer distinction
+                                       // (statement uses 'paymentShareAllocated' uniformly);
+                                       // OK because downstream just sums collections.
+            status: 'cleared',
+            transactionDate: f.date,
+            amount: f.amount,          // already syndicator-share applied
+            direction: 'in',
+          });
+        }
+      } else {
+        // Legacy fallback: hit the per-deal payments endpoint.
+        fetchPaymentsCallback = (dealInternalId) =>
+          apiFetch(`/deals/${dealInternalId}/payments?limit=200`);
+      }
 
-      derived = await aggregateSyndicatorMetrics(deals, syndicatorId, feeConfig, sub, fetchPayments);
+      derived = await aggregateSyndicatorMetrics(
+        deals, syndicatorId, feeConfig, sub,
+        fetchPaymentsCallback,
+        perDealCollectionsFromStatement
+      );
       fin = combineFinancials(sub, derived, synInfo);
       flows = buildFlows(sub, fin, derived, deals, syndicatorId, undefined, feeConfig);
     }
@@ -2296,12 +2377,13 @@ export default async function handler(req, res) {
           feeSource: derived.feeSource, // 'ledger' or 'derived'
         } : null,
         financials: fin,
-        // Phase 2 Step 2: parallel statement parse (diagnostics-only).
-        // When `ok: true`, the parser ran successfully on the statement
-        // endpoint and the `diffs` show how its values compare to the
-        // legacy paths (subledger and /syndicators/export). Goal for this
-        // step: confirm all diffs are ~0, then in Step 3 we drop the
-        // legacy paths and use the parser as primary.
+        // Phase 2 Step 3: statement parser is the PRIMARY data source.
+        //   - `parsedStatementDiagnostics.ok: true`        → parser ran successfully, sub
+        //                                                    is derived from parsed statement
+        //   - `parsedStatementDiagnostics.fallback: ...`   → statement path failed,
+        //                                                    legacy subledger path used
+        //   - `parsedStatementDiagnostics.reconcile.ok`    → totals match SmartMCA's
+        //                                                    /summary block (regression check)
         statement: parsedStatementDiagnostics,
         // Selected parsed values (only when parser ran successfully) so
         // we can spot-check totals from the live response without needing
