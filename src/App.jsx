@@ -587,7 +587,16 @@ function SyndicatorPage({ DATA }) {
           <tr><td colSpan={2} style={hdr}>TOTAL VALUE CREATED</td></tr>
           <tr><td style={{ ...lbl, paddingLeft: 28 }}>Cash Received (Payouts)</td><td style={val}>{fmt(s.totalWithdrawals)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= Withdrawals</span></td></tr>
           <tr><td style={{ ...lbl, paddingLeft: 28 }}>+ Current Balance</td><td style={val}>{fmt(s.currentCashBalance)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= Available Cash</span></td></tr>
-          <tr><td style={{ ...lbl, paddingLeft: 28 }}>+ Outstanding Principal in Deals</td><td style={val}>{fmt(s.unrealizedValue)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= Invested − Collected</span></td></tr>
+          <tr><td style={{ ...lbl, paddingLeft: 28 }}>+ Outstanding Principal (Active Deals)</td><td style={val}>{fmt(s.unrealizedValueActive != null ? s.unrealizedValueActive : s.unrealizedValue)} <span style={{ color: "#5a7a9a", fontSize: 11 }}>= still being collected</span></td></tr>
+          {s.unrealizedValueDefaulted != null && s.unrealizedValueDefaulted > 0 && (
+            <tr>
+              <td style={{ ...lbl, paddingLeft: 28, color: "#888" }}>
+                <span style={{ textDecoration: "line-through" }}>+ Unrecovered Principal (Defaulted)</span>
+                <span style={{ color: "#5a7a9a", fontSize: 11, marginLeft: 8 }}>(excluded from Total Value — write-off)</span>
+              </td>
+              <td style={{ ...neg, color: "#888" }}><span style={{ textDecoration: "line-through" }}>{fmt(s.unrealizedValueDefaulted)}</span></td>
+            </tr>
+          )}
           <tr><td style={{ ...lbl, fontWeight: 700, color: "#084372" }}>= Total Current Value</td><td style={valB}>{fmt(s.totalCurrentValue)}</td></tr>
           <tr><td style={{ ...lbl, paddingLeft: 28 }}>− External Capital Contributed</td><td style={neg}>{fmt(-s.externalCapital)}</td></tr>
           <tr><td style={{ background: "#052B4C", color: "#fff", fontWeight: 700, fontSize: 14, padding: "12px 14px" }}>NET PROFIT / (LOSS)</td>

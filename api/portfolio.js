@@ -768,6 +768,16 @@ export default async function handler(req, res) {
     let dealsParticipated = 0;  // count of deals where LMJS participates
     const perDealShares = [];   // per-deal {dealId, pct} for collection breakdown
 
+    // Status-bucketed accumulators. Used downstream to split "Outstanding
+    // Principal in Deals" into the genuinely-active component (asset still
+    // being collected) vs the defaulted-but-not-yet-recovered component
+    // (write-off; treating it as a current asset overstates Net Profit).
+    // Closed deals (status === 'Profit'/'closed') don't need a bucket because
+    // their unreturned is mathematically 0 (they're paid off).
+    let syndInvestedActive = 0,    syndCollectedActive = 0;
+    let syndInvestedDefaulted = 0, syndCollectedDefaulted = 0;
+    let syndInvestedClosed = 0,    syndCollectedClosed = 0;
+
     for (const deal of deals) {
       const synd = extractSyndicationFor(deal, syndicatorId);
       // Skip if no syndication record OR zero-stake (sometimes syndicators
@@ -778,9 +788,26 @@ export default async function handler(req, res) {
       if (num(synd.fundedAmount) <= 0) continue;
 
       dealsParticipated++;
-      syndInvested += num(synd.fundedAmount);
-      syndCollected += num(synd.cashCollected);
+      const dealInvested  = num(synd.fundedAmount);
+      const dealCollected = num(synd.cashCollected);
+      syndInvested += dealInvested;
+      syndCollected += dealCollected;
       syndExposure += num(synd.cashExposure);
+
+      // Bucket by status. Note: deal.status uses the raw API values
+      // ('defaulted' | 'closed' | other → active). This mirrors the status
+      // mapping in mapDeal() at the top of the file.
+      if (deal.status === 'defaulted') {
+        syndInvestedDefaulted  += dealInvested;
+        syndCollectedDefaulted += dealCollected;
+      } else if (deal.status === 'closed') {
+        syndInvestedClosed  += dealInvested;
+        syndCollectedClosed += dealCollected;
+      } else {
+        syndInvestedActive  += dealInvested;
+        syndCollectedActive += dealCollected;
+      }
+
       perDealShares.push({
         dealInternalId: deal.id,
         dealNo: deal.dealId,
@@ -791,6 +818,12 @@ export default async function handler(req, res) {
     syndInvested = round2(syndInvested);
     syndCollected = round2(syndCollected);
     syndExposure = round2(syndExposure);
+    syndInvestedActive    = round2(syndInvestedActive);
+    syndCollectedActive   = round2(syndCollectedActive);
+    syndInvestedDefaulted = round2(syndInvestedDefaulted);
+    syndCollectedDefaulted= round2(syndCollectedDefaulted);
+    syndInvestedClosed    = round2(syndInvestedClosed);
+    syndCollectedClosed   = round2(syndCollectedClosed);
 
     // Collection breakdown by type, aggregated from /deals/{id}/payments.
     // Each payment is scaled by the syndicator's investmentPercentage on
@@ -918,6 +951,17 @@ export default async function handler(req, res) {
       syndInvested,
       syndCollected,
       syndExposure,
+      // Status-bucketed splits — used to separate genuinely-outstanding
+      // principal (active deals, still being collected) from defaulted
+      // unrecovered principal (write-off, gone). Closed deals are tracked
+      // for completeness but mathematically contribute nothing to "unreturned"
+      // (they're paid off). See combineFinancials for usage.
+      syndInvestedActive,
+      syndCollectedActive,
+      syndInvestedDefaulted,
+      syndCollectedDefaulted,
+      syndInvestedClosed,
+      syndCollectedClosed,
       // From payments endpoint (scaled by investmentPercentage)
       merchantPayments,
       refiProceeds,
@@ -997,11 +1041,40 @@ export default async function handler(req, res) {
       ? 'smartmca_available_cash'
       : 'derived';
 
-    // Unreturned Principal = Total Invested - Gross Collections (floored at 0)
-    const unreturned = round2(Math.max(0, totalInvestments - derived.totalGrossCollections));
+    // Unreturned Principal — split by deal status to be honest about what's
+    // actually a recoverable asset.
+    //
+    //   unreturnedActive    = principal still in deals that are paying. This
+    //                         IS a real asset; collections are still arriving.
+    //   unreturnedDefaulted = principal in deals that defaulted and aren't
+    //                         being collected. This is effectively a write-off
+    //                         — including it in Total Value would overstate
+    //                         net profit by the amount unlikely to be recovered.
+    //
+    // Per-bucket flooring at 0 matches the existing single-line behavior
+    // (a deal that collected more than invested doesn't generate negative
+    // unreturned — it's already accounted for as profit elsewhere).
+    //
+    // Falls back to the legacy combined formula when bucketed data isn't
+    // available (e.g., portfolio view, or derived built without status info).
+    let unreturnedActive, unreturnedDefaulted, unreturned;
+    if (derived && derived.syndInvestedActive != null) {
+      unreturnedActive    = round2(Math.max(0, derived.syndInvestedActive    - derived.syndCollectedActive));
+      unreturnedDefaulted = round2(Math.max(0, derived.syndInvestedDefaulted - derived.syndCollectedDefaulted));
+      // Keep `unreturned` as the sum so callers that don't care about the
+      // split see the same total they did before. Total Value below uses
+      // only `unreturnedActive`.
+      unreturned = round2(unreturnedActive + unreturnedDefaulted);
+    } else {
+      // Legacy fallback: single-bucket calc.
+      unreturnedActive    = round2(Math.max(0, totalInvestments - derived.totalGrossCollections));
+      unreturnedDefaulted = 0;
+      unreturned = unreturnedActive;
+    }
 
-    // Total Value = Withdrawals + Cash Balance + Unreturned
-    const totalValue = round2(sub.totalWithdrawals + cashBalance + unreturned);
+    // Total Value = Withdrawals + Cash Balance + Unreturned (ACTIVE only).
+    // Defaulted unrecovered principal is a write-off, not a current asset.
+    const totalValue = round2(sub.totalWithdrawals + cashBalance + unreturnedActive);
 
     // Net Profit = Total Value - External Capital
     const netProfit = round2(totalValue - sub.externalCapital);
@@ -1026,6 +1099,8 @@ export default async function handler(req, res) {
       totalFees,
       feeSource,
       unreturned,
+      unreturnedActive,
+      unreturnedDefaulted,
       totalValue,
       netProfit,
       netCapitalDeployed,
@@ -2343,6 +2418,16 @@ export default async function handler(req, res) {
       unrealizedValue: hasSyndicator
         ? Math.round(fin.unreturned)
         : Math.round(agg.totalUnreturnedAll || 0),
+      // Split: outstanding-active (genuine asset, still being collected) vs
+      // outstanding-defaulted (write-off; not currently producing collections).
+      // Portfolio view returns null — bucketed status data isn't aggregated
+      // across syndicators.
+      unrealizedValueActive: hasSyndicator && fin.unreturnedActive != null
+        ? Math.round(fin.unreturnedActive)
+        : null,
+      unrealizedValueDefaulted: hasSyndicator && fin.unreturnedDefaulted != null
+        ? Math.round(fin.unreturnedDefaulted)
+        : null,
       pctStillOutstanding: hasSyndicator && totalInvested > 0
         ? round2(fin.unreturned / totalInvested)
         : (!hasSyndicator && (agg.totalInvestedAll || 0) > 0
