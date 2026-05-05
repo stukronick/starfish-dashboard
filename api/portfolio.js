@@ -2339,24 +2339,29 @@ export default async function handler(req, res) {
                 - (agg.totalFeesAll || 0)
               )
             : null),
-      // Total Current Value = withdrawals + cash balance + unreturned.
+      // Total Current Value = withdrawals + cash balance + unreturned-ACTIVE.
+      // Defaulted unrecovered principal is a write-off, not a current asset.
+      // Per-syndicator: fin.totalValue is computed in combineFinancials using
+      // unreturnedActive only. Portfolio: same logic via aggregate buckets.
       totalCurrentValue: hasSyndicator
         ? Math.round(fin.totalValue)
         : Math.round(
             (agg.totalWithdrawnAll || 0)
             + (agg.totalAvailableCashAll || 0)
-            + (agg.totalUnreturnedAll || 0)
+            + (agg.unreturnedActiveAll || 0)
           ),
       // Net Profit = Total Value - External Capital. Portfolio uses
       // externalCapitalAll from the statement fan-out (sum of real external
       // deposits, NOT totalDeposited which double-counts reinvestments).
+      // Total Value uses unreturnedActiveAll, NOT totalUnreturnedAll, so
+      // defaulted write-offs don't inflate Net Profit.
       netProfit: hasSyndicator
         ? Math.round(fin.netProfit)
         : (agg.externalCapitalAll != null
             ? Math.round(
                 (agg.totalWithdrawnAll || 0)
                 + (agg.totalAvailableCashAll || 0)
-                + (agg.totalUnreturnedAll || 0)
+                + (agg.unreturnedActiveAll || 0)
                 - (agg.externalCapitalAll || 0)
               )
             : null),
@@ -2369,14 +2374,14 @@ export default async function handler(req, res) {
             ? round2(portfolioFlows.projectedXIRR)
             : null),
       // Cash-on-Cash Multiple = Total Value / External Capital. Same
-      // denominator change as netProfit.
+      // denominator change as netProfit; same active-only Total Value.
       cashOnCashMultiple: hasSyndicator
         ? fin.cashOnCash
         : (agg.externalCapitalAll != null && agg.externalCapitalAll > 0
             ? round2(
                 ((agg.totalWithdrawnAll || 0)
                 + (agg.totalAvailableCashAll || 0)
-                + (agg.totalUnreturnedAll || 0))
+                + (agg.unreturnedActiveAll || 0))
                 / agg.externalCapitalAll
               )
             : null),
@@ -2420,14 +2425,15 @@ export default async function handler(req, res) {
         : Math.round(agg.totalUnreturnedAll || 0),
       // Split: outstanding-active (genuine asset, still being collected) vs
       // outstanding-defaulted (write-off; not currently producing collections).
-      // Portfolio view returns null — bucketed status data isn't aggregated
-      // across syndicators.
-      unrealizedValueActive: hasSyndicator && fin.unreturnedActive != null
-        ? Math.round(fin.unreturnedActive)
-        : null,
-      unrealizedValueDefaulted: hasSyndicator && fin.unreturnedDefaulted != null
-        ? Math.round(fin.unreturnedDefaulted)
-        : null,
+      // Per-syndicator: from fin (combineFinancials buckets via derived).
+      // Portfolio: from aggregate buckets, computed by walking every (deal,
+      // syndication) pair in the deals fan-out.
+      unrealizedValueActive: hasSyndicator
+        ? (fin.unreturnedActive != null ? Math.round(fin.unreturnedActive) : null)
+        : Math.round(agg.unreturnedActiveAll || 0),
+      unrealizedValueDefaulted: hasSyndicator
+        ? (fin.unreturnedDefaulted != null ? Math.round(fin.unreturnedDefaulted) : null)
+        : Math.round(agg.unreturnedDefaultedAll || 0),
       pctStillOutstanding: hasSyndicator && totalInvested > 0
         ? round2(fin.unreturned / totalInvested)
         : (!hasSyndicator && (agg.totalInvestedAll || 0) > 0
@@ -2597,6 +2603,44 @@ export default async function handler(req, res) {
     // END PORTFOLIO STATEMENT FAN-OUT
     // ============================================================================
 
+    // ============================================================================
+    // PORTFOLIO-WIDE OUTSTANDING PRINCIPAL, BUCKETED BY DEAL STATUS
+    //
+    // For Total Value Created at portfolio level, we want to count ONLY active-
+    // deal outstanding principal (genuine asset, still being collected) and
+    // exclude defaulted-deal unrecovered principal (write-off, gone). Same
+    // logic the per-syndicator path uses, applied to every (deal, syndication)
+    // pair in the data.
+    //
+    // Why this works without per-syndicator statement parsing: each deal
+    // record carries its full syndications array with each participant's
+    // fundedAmount and cashCollected. So we can compute portfolio totals
+    // directly from the deals fan-out.
+    //
+    // Math identity (sanity check): the sum of bucketed unreturned should
+    // equal totalUnreturnedAll (same per-syndicator floor applied at the
+    // syndication level rather than at the syndicator-aggregate level).
+    // ============================================================================
+    let unreturnedActiveAll = 0;
+    let unreturnedDefaultedAll = 0;
+    let unreturnedClosedAll = 0;
+    for (const d of deals) {
+      if (!Array.isArray(d.syndications)) continue;
+      for (const s of d.syndications) {
+        const invested  = parseFloat(s.fundedAmount) || 0;
+        const collected = parseFloat(s.cashCollected) || 0;
+        if (invested <= 0) continue;
+        const unret = Math.max(0, invested - collected);
+        if (unret <= 0) continue;
+        if (d.status === 'defaulted') unreturnedDefaultedAll += unret;
+        else if (d.status === 'closed') unreturnedClosedAll += unret;
+        else unreturnedActiveAll += unret;
+      }
+    }
+    unreturnedActiveAll    = round2(unreturnedActiveAll);
+    unreturnedDefaultedAll = round2(unreturnedDefaultedAll);
+    unreturnedClosedAll    = round2(unreturnedClosedAll);
+
     const aggregate = {
       totalInvestedAll: allSyndicators.reduce((s, c) => s + c.totalInvested, 0),
       totalAvailableCashAll: allSyndicators.reduce((s, c) => s + c.availableCash, 0),
@@ -2617,6 +2661,14 @@ export default async function handler(req, res) {
       totalUnreturnedAll: allSyndicators.reduce(
         (s, c) => s + Math.max(0, c.totalInvestedLedger - c.cashCollectedGross), 0
       ),
+      // Status-bucketed split — same calc, but separating active deals
+      // (genuine outstanding asset) from defaulted (write-off, excluded
+      // from Total Value Created at portfolio level). Computed by walking
+      // every (deal, syndication) pair above. Closed deals included for
+      // completeness but typically ~$0 (paid off → unreturned = 0).
+      unreturnedActiveAll,
+      unreturnedDefaultedAll,
+      unreturnedClosedAll,
       // ----- From per-syndicator statement fan-out (when available) -----
       // External capital is the cleanest "money in from outside" denominator
       // for portfolio-wide ROI/profit metrics. Requires statement parsing
@@ -2982,6 +3034,44 @@ export default async function handler(req, res) {
         portfolioStatement: portfolioStatementDiagnostics,
         // Portfolio-wide projected XIRR composition (when no syndicator selected).
         portfolioFlows: portfolioFlows ? portfolioFlows.composition : null,
+        // Diagnostic: distribution of `deal.status` raw API values across
+        // the deals fetch. Used to verify our defaulted-deal bucketing logic
+        // catches everything it should (currently checks for the literal
+        // string 'defaulted'). If any unexpected statuses appear here that
+        // semantically mean "write-off" but aren't 'defaulted', we'd want to
+        // expand the bucketing logic.
+        dealStatusBreakdown: (() => {
+          const counts = {};
+          let totalUnret = 0;
+          for (const d of deals) {
+            const st = d.status || '(null)';
+            if (!counts[st]) counts[st] = { count: 0, totalFunded: 0, totalCollected: 0, unreturned: 0 };
+            counts[st].count++;
+            // Sum funded/collected across ALL syndications for this deal
+            // (not just the requested syndicator) so we see deal-level totals.
+            if (Array.isArray(d.syndications)) {
+              for (const s of d.syndications) {
+                const f = parseFloat(s.fundedAmount) || 0;
+                const c = parseFloat(s.cashCollected) || 0;
+                counts[st].totalFunded    += f;
+                counts[st].totalCollected += c;
+                counts[st].unreturned     += Math.max(0, f - c);
+                totalUnret += Math.max(0, f - c);
+              }
+            }
+          }
+          // Round for display
+          for (const st of Object.keys(counts)) {
+            counts[st].totalFunded    = Math.round(counts[st].totalFunded);
+            counts[st].totalCollected = Math.round(counts[st].totalCollected);
+            counts[st].unreturned     = Math.round(counts[st].unreturned);
+          }
+          return {
+            byStatus: counts,
+            totalDeals: deals.length,
+            totalUnreturnedAcrossSyndicators: Math.round(totalUnret),
+          };
+        })(),
         // Selected parsed values (only when parser ran successfully) so
         // we can spot-check totals from the live response without needing
         // to add a separate endpoint.
