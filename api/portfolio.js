@@ -308,12 +308,14 @@ async function cachedApiFetch(path, apiKey, apiBase, { bypass = false } = {}) {
   throw lastError || new Error(`fetch failed after ${MAX_ATTEMPTS} attempts: ${path}`);
 }
 
-// Upgrade a cached deal's TTL to 24h once we know it's closed/defaulted.
-// Called from getAllDeals after deal detail is in hand.
+// Upgrade a cached deal's TTL to 24h once we know it's permanently terminated.
+// Called from getAllDeals after deal detail is in hand. closed = paid off via
+// collections, defaulted = write-off, refinanced = paid off via refi proceeds.
+// All three are terminal states with no further updates expected.
 async function upgradeDealTtlIfClosed(internalId, dealRecord) {
   if (!dealRecord) return;
   const status = dealRecord.status;
-  if (status !== 'closed' && status !== 'defaulted') return;
+  if (status !== 'closed' && status !== 'defaulted' && status !== 'refinanced') return;
 
   const dealPath = `/deals/${internalId}`;
   const paymentsPath = `/deals/${internalId}/payments?limit=200`;
@@ -538,7 +540,11 @@ export default async function handler(req, res) {
 
     let status;
     if (d.status === 'defaulted') status = 'Default';
-    else if (d.status === 'closed') status = 'Profit';
+    // 'closed' = paid off via normal collections to RTR. 'refinanced' = paid
+    // off via refi proceeds (merchant got new financing that paid out the
+    // remaining balance). Both are economically equivalent: capital recovered,
+    // no further collections expected. Group both as 'Profit' for display.
+    else if (d.status === 'closed' || d.status === 'refinanced') status = 'Profit';
     else status = 'Active';
 
     // Choose which numbers to surface based on whether we have a syndication.
@@ -795,12 +801,15 @@ export default async function handler(req, res) {
       syndExposure += num(synd.cashExposure);
 
       // Bucket by status. Note: deal.status uses the raw API values
-      // ('defaulted' | 'closed' | other → active). This mirrors the status
-      // mapping in mapDeal() at the top of the file.
+      // ('defaulted' | 'closed' | 'refinanced' | other → active). The Closed
+      // bucket includes both 'closed' (paid off via collections) and
+      // 'refinanced' (paid off via refi proceeds) — both are economically
+      // "asset recovered, no further collections expected" and produce $0
+      // unreturned. This mirrors mapDeal's status grouping.
       if (deal.status === 'defaulted') {
         syndInvestedDefaulted  += dealInvested;
         syndCollectedDefaulted += dealCollected;
-      } else if (deal.status === 'closed') {
+      } else if (deal.status === 'closed' || deal.status === 'refinanced') {
         syndInvestedClosed  += dealInvested;
         syndCollectedClosed += dealCollected;
       } else {
@@ -2633,7 +2642,9 @@ export default async function handler(req, res) {
         const unret = Math.max(0, invested - collected);
         if (unret <= 0) continue;
         if (d.status === 'defaulted') unreturnedDefaultedAll += unret;
-        else if (d.status === 'closed') unreturnedClosedAll += unret;
+        // Both 'closed' (paid off via collections) and 'refinanced' (paid off
+        // via refi proceeds) → asset recovered, no further collections.
+        else if (d.status === 'closed' || d.status === 'refinanced') unreturnedClosedAll += unret;
         else unreturnedActiveAll += unret;
       }
     }
